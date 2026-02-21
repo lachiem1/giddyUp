@@ -1,0 +1,15 @@
+# Local environment files should never be committed.
+.env
+.env.*
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.out
+
+# macOS
+.DS_Store
+
+# Local planning docs (do not commit)
+product-roadmap.md

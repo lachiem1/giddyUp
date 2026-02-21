@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks help 2>/dev/null | grep -qE '^\s+git\s'; then
+    gitleaks git --staged --redact --verbose
+  else
+    gitleaks protect --staged --redact --verbose
+  fi
+  exit 0
+fi
+
+echo "gitleaks is required for pre-commit secret scanning." >&2
+echo "Install: brew install gitleaks" >&2
+exit 1
