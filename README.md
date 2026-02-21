@@ -24,6 +24,14 @@ Run the app (it reads Keychain automatically):
 go run ./cmd/giddyup
 ```
 
+Verify API connectivity:
+
+```bash
+go run ./cmd/giddyup ping
+```
+
+The command prints `connected successfully` only when `/util/ping` returns HTTP 200.
+
 If you want custom key names:
 
 ```bash
