@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,17 +10,32 @@ import (
 	"strings"
 
 	"github.com/lachiem1/giddyUp/internal/auth"
+	"github.com/lachiem1/giddyUp/internal/upapi"
 	"golang.org/x/term"
 )
 
 func main() {
-	if len(os.Args) >= 3 && os.Args[1] == "auth" && os.Args[2] == "set" {
-		if err := runAuthSet(); err != nil {
-			fmt.Fprintf(os.Stderr, "auth set error: %v\n", err)
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "auth":
+			if len(os.Args) >= 3 && os.Args[2] == "set" {
+				if err := runAuthSet(); err != nil {
+					fmt.Fprintf(os.Stderr, "auth set error: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("PAT saved to your system credential store.")
+				return
+			}
+			fmt.Fprintln(os.Stderr, "usage: giddyup auth set")
 			os.Exit(1)
+		case "ping":
+			if err := runPing(); err != nil {
+				fmt.Fprintf(os.Stderr, "ping error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("connected successfully")
+			return
 		}
-		fmt.Println("PAT saved to your system credential store.")
-		return
 	}
 
 	pat, err := auth.LoadPAT()
@@ -30,6 +46,20 @@ func main() {
 
 	// Do not print token value.
 	fmt.Printf("PAT loaded successfully (%d chars).\n", len(pat))
+}
+
+func runPing() error {
+	if len(os.Args) != 2 {
+		return errors.New("usage: giddyup ping")
+	}
+
+	pat, err := auth.LoadPAT()
+	if err != nil {
+		return err
+	}
+
+	client := upapi.New(pat)
+	return client.Ping(context.Background())
 }
 
 func runAuthSet() error {
