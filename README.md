@@ -1,6 +1,26 @@
 # Giddy Up
 
-Giddy Up is a way for Up Bank customers to view and track their own budget and spending via a Terminal User Interface (TUI). More to come.
+**Unofficial product: Giddy Up is not affiliated with, endorsed by, sponsored by, or connected to Up in any way.**
+
+![GiddyUp Logo](./giddyup-logo.png)
+
+Giddy Up is a way for Up customers to view and track their own budget and spending via a Terminal User Interface (TUI). More to come.
+
+## Up API acceptable use
+
+This product is designed for personal, local use only:
+
+- Personal use only: this software is for each user's personal usage.
+- Your token only: each user must use their own Up Personal Access Token (PAT).
+- No token sharing: do not share PATs with any third party, including partners/relatives.
+- Reasonable request volume only: do not abuse, disrupt, or overload the API.
+- No probing undocumented endpoints: only call documented API routes.
+- No unauthorized data access: only access your own data.
+- No commercial data extraction: do not extract data (for example merchant data) for commercial applications.
+- User-responsible token security: users are responsible for securing their own PAT.
+- No uptime guarantee: API availability may change and access may be suspended without notice.
+
+Giddy Up does not run a backend service for user data. API calls are made directly from the user's machine to Up using the user's own PAT.
 
 ## Security-first auth setup (no .env)
 
@@ -13,6 +33,7 @@ go run ./cmd/giddyup auth set
 ```
 
 The command prompts for your PAT with hidden input and stores it in your OS credential store.
+`giddyup auth set` stores the PAT locally in the user's system keychain only. At no point is the PAT sent to any server or third-party service.
 At runtime, PAT loading order is:
 
 1. `UP_PAT` environment variable, if set.
@@ -31,6 +52,27 @@ go run ./cmd/giddyup ping
 ```
 
 The command prints `connected successfully` only when `/util/ping` returns HTTP 200.
+
+## Up API client layout
+
+Routes are grouped by endpoint type under `internal/upapi`:
+
+- `accounts.go`
+- `attachments.go`
+- `categories.go`
+- `tags.go`
+- `transactions.go`
+- `utilities.go`
+
+Paginated list routes send `page[size]=15`.
+
+## Integration tests
+
+Run integration tests for all non-webhook route groups:
+
+```bash
+go test -tags=integration ./internal/upapi -v
+```
 
 If you want custom key names:
 
