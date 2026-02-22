@@ -14,6 +14,7 @@ dist/
 # Local planning docs (do not commit)
 product-roadmap.md
 AGENTS.md
+tui-plan.md
 
 # Local SQLite
 *.db
