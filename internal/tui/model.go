@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/lachiem1/giddyUp/internal/auth"
+	"github.com/lachiem1/giddyUp/internal/storage"
 	"github.com/lachiem1/giddyUp/internal/upapi"
 )
 
@@ -32,6 +33,15 @@ type savePATMsg struct {
 	err error
 }
 
+type deletePATMsg struct {
+	err error
+}
+
+type wipeDBMsg struct {
+	path string
+	err  error
+}
+
 type clearCommandTextMsg struct {
 	id int
 }
@@ -44,6 +54,14 @@ type commandSpec struct {
 	name        string
 	description string
 }
+
+type authDialogMode int
+
+const (
+	authDialogNone authDialogMode = iota
+	authDialogConnect
+	authDialogDisconnect
+)
 
 type model struct {
 	width  int
@@ -65,7 +83,8 @@ type model struct {
 	commandSuggestionOffset int
 
 	showHelpOverlay bool
-	showPATPrompt   bool
+	authDialog      authDialogMode
+	connectHint     string
 	quitting        bool
 }
 
@@ -94,7 +113,8 @@ func New() tea.Model {
 		cmd:          cmd,
 		pat:          pat,
 		status:       stateChecking,
-		statusDetail: "checking connection...",
+		statusDetail: "not connected",
+		authDialog:   authDialogNone,
 		commandText:  "",
 	}
 }
@@ -119,24 +139,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = stateDisconnected
 			m.statusDetail = "not connected"
-			if msg.err != nil {
-				m.statusDetail = "not connected: " + msg.err.Error()
-			}
 		}
 		return m, nil
 
 	case savePATMsg:
-		m.showPATPrompt = false
+		m.authDialog = authDialogNone
 		m.pat.SetValue("")
+		m.pat.Blur()
 		m.cmd.Focus()
 		if msg.err != nil {
 			m.status = stateDisconnected
-			m.statusDetail = "failed to save PAT: " + msg.err.Error()
+			m.statusDetail = "not connected"
 			return m, nil
 		}
-		m.status = stateChecking
-		m.statusDetail = "checking connection..."
-		return m, checkConnectionCmd
+		m.status = stateDisconnected
+		m.statusDetail = "not connected"
+		next, cmd := m.withCommandFeedback("PAT saved to keychain.")
+		return next, tea.Batch(cmd, checkConnectionCmd)
+
+	case deletePATMsg:
+		m.authDialog = authDialogNone
+		m.pat.SetValue("")
+		m.pat.Blur()
+		m.cmd.Focus()
+		if msg.err != nil {
+			return m.withCommandFeedback("failed to remove PAT: " + msg.err.Error())
+		}
+		m.status = stateDisconnected
+		m.statusDetail = "not connected"
+		return m.withCommandFeedback("PAT removed from keychain.")
+
+	case wipeDBMsg:
+		if msg.err != nil {
+			return m.withCommandFeedback("db wipe failed: " + msg.err.Error())
+		}
+		return m.withCommandFeedback("local database wiped: " + msg.path)
 
 	case clearCommandTextMsg:
 		if msg.id == m.commandTextID {
@@ -151,7 +188,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		if m.showHelpOverlay || m.showPATPrompt {
+		if m.showHelpOverlay || m.authDialog != authDialogNone {
 			return m, nil
 		}
 
@@ -187,16 +224,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if m.showPATPrompt {
+		if m.authDialog != authDialogNone {
 			switch msg.String() {
 			case "esc":
-				m.showPATPrompt = false
+				m.authDialog = authDialogNone
 				m.pat.Blur()
 				m.cmd.Focus()
 				return m, nil
 			case "enter":
-				pat := strings.TrimSpace(m.pat.Value())
-				return m, savePATCmd(pat)
+				if m.authDialog == authDialogConnect {
+					pat := strings.TrimSpace(m.pat.Value())
+					return m, savePATCmd(pat)
+				}
+				if m.authDialog == authDialogDisconnect {
+					return m, deletePATCmd
+				}
+			}
+			if m.authDialog == authDialogDisconnect {
+				return m, nil
 			}
 			var cmd tea.Cmd
 			m.pat, cmd = m.pat.Update(msg)
@@ -234,14 +279,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.selected < len(m.viewItems)-1 {
 				m.selected++
-			}
-		case "c":
-			if m.status == stateDisconnected {
-				m.showPATPrompt = true
-				m.pat.Focus()
-				m.cmd.Blur()
-				m.clearCommandSuggestions()
-				return m, nil
 			}
 		case "enter":
 			input := strings.TrimSpace(m.cmd.Value())
@@ -291,13 +328,12 @@ func (m model) View() string {
 	}
 	header = lipgloss.NewStyle().PaddingBottom(1).Render(header)
 
-	statusDot := "●"
-	statusColor := lipgloss.Color("#F15B5B")
+	statusLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("status: ")
+	statusValue := lipgloss.NewStyle().Foreground(lipgloss.Color("#F15B5B")).Bold(true).Render("not connected")
 	if m.status == stateConnected {
-		statusColor = lipgloss.Color("#5CCB76")
+		statusValue = lipgloss.NewStyle().Foreground(lipgloss.Color("#5CCB76")).Bold(true).Render("connected")
 	}
-	statusLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("status: ") +
-		lipgloss.NewStyle().Foreground(statusColor).Render(statusDot) + " " + m.statusDetail
+	statusLine := statusLabel + statusValue
 
 	listWidth := 24
 	rightWidth := max(36, m.width-listWidth-20)
@@ -308,7 +344,7 @@ func (m model) View() string {
 		Padding(0, 1).
 		Height(panelHeight).
 		Width(listWidth).
-		Render(renderViews(m.viewItems, m.selected, statusLine, m.status == stateDisconnected))
+		Render(renderViews(m.viewItems, m.selected, statusLine))
 
 	panelWidth := max(18, (rightWidth-2)/2)
 	pinnedStyle := lipgloss.NewStyle().
@@ -415,21 +451,18 @@ func (m model) View() string {
 	}
 	bodyText += "\n" + bottomSection
 
-	if m.showPATPrompt {
-		prompt := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FFD54A")).
-			Padding(1, 2).
-			Render("Connect to Up\n\n" + m.pat.View() + "\n\nEnter to save, Esc to cancel")
-		bodyText += "\n\n" + prompt
-	}
-
 	content := contentStyle.Render(bodyText)
 
 	if m.showHelpOverlay {
 		helpOverlay := renderHelpOverlay(layoutWidth)
 		layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
 		centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+		return frame.Render(contentStyle.Render(centered))
+	}
+	if m.authDialog != authDialogNone {
+		authOverlay := m.renderAuthDialog(layoutWidth)
+		layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+		centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
 		return frame.Render(contentStyle.Render(centered))
 	}
 
@@ -452,14 +485,35 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 	case "/transactions":
 		m.selected = 1
 		return m.withCommandFeedback("transactions view selected")
+	case "/ping":
+		next, cmd := m.withCommandFeedback("checking connection...")
+		return next, tea.Batch(cmd, checkConnectionCmd)
+	case "/db-wipe", "/db wipe":
+		next, cmd := m.withCommandFeedback("wiping local database...")
+		return next, tea.Batch(cmd, wipeDBCmd)
+	case "/disconnect":
+		m.authDialog = authDialogDisconnect
+		m.pat.SetValue("")
+		m.pat.Blur()
+		m.cmd.Blur()
+		m.clearCommandSuggestions()
+		return m, nil
 	case "/settings":
 		return m.withCommandFeedback("settings has been removed from the views list.")
 	case "/connect":
-		m.showPATPrompt = true
+		hasPAT, err := auth.HasStoredPAT()
+		if err != nil {
+			return m.withCommandFeedback("failed to check stored PAT: " + err.Error())
+		}
+		m.connectHint = "Enter your PAT to save it to keychain."
+		if hasPAT {
+			m.connectHint = "A PAT already exists. Enter a new PAT to replace it."
+		}
+		m.authDialog = authDialogConnect
 		m.pat.Focus()
 		m.cmd.Blur()
 		m.clearCommandSuggestions()
-		return m.withCommandFeedback("enter your PAT in the prompt to connect.")
+		return m, nil
 	default:
 		return m.withCommandFeedback(fmt.Sprintf("Unknown command: %s", input))
 	}
@@ -505,6 +559,25 @@ func clearButtonFlashCmd(id int) tea.Cmd {
 	})
 }
 
+func deletePATCmd() tea.Msg {
+	return deletePATMsg{err: auth.RemovePAT()}
+}
+
+func wipeDBCmd() tea.Msg {
+	cfg, err := storage.Wipe()
+	if err != nil {
+		return wipeDBMsg{err: err}
+	}
+
+	db, _, err := storage.Open(context.Background())
+	if err != nil {
+		return wipeDBMsg{err: fmt.Errorf("reinitialize database: %w", err)}
+	}
+	_ = db.Close()
+
+	return wipeDBMsg{path: cfg.Path}
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -523,7 +596,7 @@ func canvasSafeWidth(width int) int {
 	return max(20, width-10)
 }
 
-func renderViews(items []string, selected int, statusLine string, disconnected bool) string {
+func renderViews(items []string, selected int, statusLine string) string {
 	lines := []string{statusLine, ""}
 	for i, item := range items {
 		prefix := "  "
@@ -531,9 +604,6 @@ func renderViews(items []string, selected int, statusLine string, disconnected b
 			prefix = "> "
 		}
 		lines = append(lines, prefix+item)
-	}
-	if disconnected {
-		lines = append(lines, "", "[c to connect]")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -623,6 +693,9 @@ func commandCatalog() []commandSpec {
 		{name: "/help", description: "show command help overlay"},
 		{name: "/accounts", description: "select the accounts view"},
 		{name: "/transactions", description: "select the transactions view"},
+		{name: "/ping", description: "check Up API connectivity"},
+		{name: "/disconnect", description: "remove saved PAT from keychain"},
+		{name: "/db-wipe", description: "wipe and reinitialize the local database"},
 		{name: "/connect", description: "open the PAT connect prompt"},
 		{name: "/settings", description: "legacy command (removed view)"},
 	}
@@ -743,6 +816,51 @@ func renderHelpOverlay(maxWidth int) string {
 		Render(content)
 }
 
+func (m model) renderAuthDialog(maxWidth int) string {
+	panelWidth := min(maxWidth-6, 64)
+	panelWidth = max(44, panelWidth)
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#6CBFE6")).
+		Padding(1, 2).
+		Width(panelWidth)
+
+	switch m.authDialog {
+	case authDialogConnect:
+		title := "Connect to Up"
+		hint := m.connectHint
+		if strings.TrimSpace(hint) == "" {
+			hint = "Enter your PAT to save it to keychain."
+		}
+
+		patInput := m.pat
+		patInput.Width = max(18, panelWidth-8)
+
+		content := strings.Join([]string{
+			title,
+			"",
+			hint,
+			"",
+			patInput.View(),
+			"",
+			"Enter to save, Esc to cancel",
+		}, "\n")
+		return panel.Render(content)
+	case authDialogDisconnect:
+		content := strings.Join([]string{
+			"Disconnect from Up",
+			"",
+			"This will remove your saved PAT from keychain.",
+			"",
+			"Enter to remove PAT, Esc to cancel",
+		}, "\n")
+		return panel.Render(content)
+	default:
+		return ""
+	}
+}
+
 type hitRect struct {
 	x int
 	y int
@@ -804,7 +922,7 @@ func (m model) selectButtonRects() []hitRect {
 		Padding(0, 1).
 		Height(panelHeight).
 		Width(listWidth).
-		Render(renderViews(m.viewItems, m.selected, "", m.status == stateDisconnected))
+		Render(renderViews(m.viewItems, m.selected, ""))
 
 	panelWidth := max(18, (rightWidth-2)/2)
 	pinnedStyle := lipgloss.NewStyle().
