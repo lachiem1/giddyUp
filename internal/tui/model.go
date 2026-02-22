@@ -36,6 +36,10 @@ type clearCommandTextMsg struct {
 	id int
 }
 
+type clearButtonFlashMsg struct {
+	id int
+}
+
 type commandSpec struct {
 	name        string
 	description string
@@ -47,6 +51,8 @@ type model struct {
 
 	viewItems []string
 	selected  int
+	clicked   int
+	clickedID int
 	cmd       textinput.Model
 	pat       textinput.Model
 
@@ -78,16 +84,17 @@ func New() tea.Model {
 
 	return model{
 		viewItems: []string{
-			"Accounts",
-			"Transactions",
-			"Spend Categories",
-			"Pay Cycle Burndown",
+			"accounts",
+			"transactions",
+			"spend categories",
+			"pay cycle burndown",
 		},
 		selected:     0,
+		clicked:      -1,
 		cmd:          cmd,
 		pat:          pat,
 		status:       stateChecking,
-		statusDetail: "Checking connection...",
+		statusDetail: "checking connection...",
 		commandText:  "",
 	}
 }
@@ -108,12 +115,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case checkConnectionMsg:
 		if msg.connected {
 			m.status = stateConnected
-			m.statusDetail = "Connected"
+			m.statusDetail = "connected"
 		} else {
 			m.status = stateDisconnected
-			m.statusDetail = "Not connected"
+			m.statusDetail = "not connected"
 			if msg.err != nil {
-				m.statusDetail = "Not connected: " + msg.err.Error()
+				m.statusDetail = "not connected: " + msg.err.Error()
 			}
 		}
 		return m, nil
@@ -124,16 +131,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cmd.Focus()
 		if msg.err != nil {
 			m.status = stateDisconnected
-			m.statusDetail = "Failed to save PAT: " + msg.err.Error()
+			m.statusDetail = "failed to save PAT: " + msg.err.Error()
 			return m, nil
 		}
 		m.status = stateChecking
-		m.statusDetail = "Checking connection..."
+		m.statusDetail = "checking connection..."
 		return m, checkConnectionCmd
 
 	case clearCommandTextMsg:
 		if msg.id == m.commandTextID {
 			m.commandText = ""
+		}
+		return m, nil
+
+	case clearButtonFlashMsg:
+		if msg.id == m.clickedID {
+			m.clicked = -1
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if m.showHelpOverlay || m.showPATPrompt {
+			return m, nil
+		}
+
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			clicked := m.selectButtonAt(msg.X, msg.Y)
+			switch clicked {
+			case 0:
+				m.clicked = 0
+				m.clickedID++
+				m.selected = 0
+				next, cmd := m.withCommandFeedback("accounts view selected")
+				return next, tea.Batch(cmd, clearButtonFlashCmd(m.clickedID))
+			case 1:
+				m.clicked = 1
+				m.clickedID++
+				m.selected = 1
+				next, cmd := m.withCommandFeedback("transactions view selected")
+				return next, tea.Batch(cmd, clearButtonFlashCmd(m.clickedID))
+			}
 		}
 		return m, nil
 
@@ -170,6 +207,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			m.quitting = true
 			return m, tea.Quit
+		case "esc":
+			if strings.TrimSpace(m.cmd.Value()) != "" || m.shouldShowCommandSuggestions() {
+				m.cmd.SetValue("")
+				m.clearCommandSuggestions()
+				return m, nil
+			}
 		case "up", "k":
 			if m.shouldShowCommandSuggestions() {
 				if m.commandSuggestionIndex > 0 {
@@ -253,7 +296,7 @@ func (m model) View() string {
 	if m.status == stateConnected {
 		statusColor = lipgloss.Color("#5CCB76")
 	}
-	statusLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("Status: ") +
+	statusLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("status: ") +
 		lipgloss.NewStyle().Foreground(statusColor).Render(statusDot) + " " + m.statusDetail
 
 	listWidth := 24
@@ -275,13 +318,12 @@ func (m model) View() string {
 		Width(panelWidth).
 		Height(panelHeight)
 	pinTitle := pinIconOrFallback()
-	selectButton := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#FFD54A")).
-		Bold(true).
-		Render("[select view]")
-	cardHeader := pinTitle + " " + selectButton
-	pinnedOne := pinnedStyle.Render(cardHeader)
-	pinnedTwo := pinnedStyle.Render(cardHeader)
+	leftSelect := renderSelectButton(m.clicked == 0)
+	rightSelect := renderSelectButton(m.clicked == 1)
+	leftHeader := pinTitle + " " + leftSelect
+	rightHeader := pinTitle + " " + rightSelect
+	pinnedOne := pinnedStyle.Render(leftHeader)
+	pinnedTwo := pinnedStyle.Render(rightHeader)
 	rightPanels := lipgloss.JoinHorizontal(lipgloss.Top, pinnedOne, "  ", pinnedTwo)
 	canvasWidth := layoutWidth
 	mainPanelsRaw := lipgloss.JoinHorizontal(lipgloss.Top, listBox, "  ", rightPanels)
@@ -332,7 +374,7 @@ func (m model) View() string {
 	if m.height > 0 {
 		availableHeight := max(0, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
 
-		coreHeight := lipgloss.Height(header) + lipgloss.Height(mainPanels) + lipgloss.Height(bottomSection) + headerGap
+		coreHeight := lipgloss.Height(header) + lipgloss.Height(mainPanelsRaw) + lipgloss.Height(bottomSection) + headerGap
 		if hasMessage {
 			coreHeight += messageGap + lipgloss.Height(messageArea)
 		}
@@ -342,7 +384,7 @@ func (m model) View() string {
 		if coreHeight+bridgeGap > availableHeight {
 			// Once bridge has reached its minimum, collapse secondary blank space.
 			headerGap = 0
-			coreHeight = lipgloss.Height(header) + lipgloss.Height(mainPanels) + lipgloss.Height(bottomSection)
+			coreHeight = lipgloss.Height(header) + lipgloss.Height(mainPanelsRaw) + lipgloss.Height(bottomSection)
 			if hasMessage {
 				coreHeight += messageGap + lipgloss.Height(messageArea)
 			}
@@ -406,18 +448,18 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/accounts":
 		m.selected = 0
-		return m.withCommandFeedback("Accounts view selected")
+		return m.withCommandFeedback("accounts view selected")
 	case "/transactions":
 		m.selected = 1
-		return m.withCommandFeedback("Transactions view selected")
+		return m.withCommandFeedback("transactions view selected")
 	case "/settings":
-		return m.withCommandFeedback("Settings has been removed from the views list.")
+		return m.withCommandFeedback("settings has been removed from the views list.")
 	case "/connect":
 		m.showPATPrompt = true
 		m.pat.Focus()
 		m.cmd.Blur()
 		m.clearCommandSuggestions()
-		return m.withCommandFeedback("Enter your PAT in the prompt to connect.")
+		return m.withCommandFeedback("enter your PAT in the prompt to connect.")
 	default:
 		return m.withCommandFeedback(fmt.Sprintf("Unknown command: %s", input))
 	}
@@ -455,6 +497,12 @@ func savePATCmd(pat string) tea.Cmd {
 		}
 		return savePATMsg{ok: true}
 	}
+}
+
+func clearButtonFlashCmd(id int) tea.Cmd {
+	return tea.Tick(450*time.Millisecond, func(time.Time) tea.Msg {
+		return clearButtonFlashMsg{id: id}
+	})
 }
 
 func max(a, b int) int {
@@ -572,11 +620,11 @@ func pinIconOrFallback() string {
 
 func commandCatalog() []commandSpec {
 	return []commandSpec{
-		{name: "/help", description: "Show command help overlay"},
-		{name: "/accounts", description: "Select the Accounts view"},
-		{name: "/transactions", description: "Select the Transactions view"},
-		{name: "/connect", description: "Open the PAT connect prompt"},
-		{name: "/settings", description: "Legacy command (removed view)"},
+		{name: "/help", description: "show command help overlay"},
+		{name: "/accounts", description: "select the accounts view"},
+		{name: "/transactions", description: "select the transactions view"},
+		{name: "/connect", description: "open the PAT connect prompt"},
+		{name: "/settings", description: "legacy command (removed view)"},
 	}
 }
 
@@ -693,4 +741,143 @@ func renderHelpOverlay(maxWidth int) string {
 		Padding(1, 2).
 		Width(panelWidth).
 		Render(content)
+}
+
+type hitRect struct {
+	x int
+	y int
+	w int
+	h int
+}
+
+func (r hitRect) contains(x, y int) bool {
+	return x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h
+}
+
+func renderSelectButton(clicked bool) string {
+	bracketStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFD54A")).
+		Bold(true)
+	textStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFD54A")).
+		Bold(true)
+	if clicked {
+		textStyle = textStyle.Underline(true)
+	}
+	return bracketStyle.Render("[") + textStyle.Render("select view") + bracketStyle.Render("]")
+}
+
+func (m model) selectButtonAt(x, y int) int {
+	rects := m.selectButtonRects()
+	for i, rect := range rects {
+		if rect.contains(x, y) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m model) selectButtonRects() []hitRect {
+	if m.width < 1 || m.height < 1 {
+		return nil
+	}
+
+	frame := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#F47A60")).
+		Padding(1, 1)
+	contentStyle := lipgloss.NewStyle().Padding(1, 1, 0, 1)
+	frame = frame.Width(max(1, m.width-frame.GetHorizontalBorderSize()))
+	frame = frame.Height(max(1, m.height-frame.GetVerticalBorderSize()))
+	layoutWidth := max(1, m.width-frame.GetHorizontalFrameSize()-contentStyle.GetHorizontalFrameSize())
+
+	header := renderBlockTitle()
+	header = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, header)
+	header = lipgloss.NewStyle().PaddingBottom(1).Render(header)
+
+	listWidth := 24
+	rightWidth := max(36, m.width-listWidth-20)
+	panelHeight := 14
+	listBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#F47A60")).
+		Padding(0, 1).
+		Height(panelHeight).
+		Width(listWidth).
+		Render(renderViews(m.viewItems, m.selected, "", m.status == stateDisconnected))
+
+	panelWidth := max(18, (rightWidth-2)/2)
+	pinnedStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#FFD54A")).
+		Padding(0, 1).
+		Width(panelWidth).
+		Height(panelHeight)
+	pinTitle := pinIconOrFallback()
+	pinnedOne := pinnedStyle.Render(pinTitle + " " + renderSelectButton(false))
+	pinnedTwo := pinnedStyle.Render(pinTitle + " " + renderSelectButton(false))
+	rightPanels := lipgloss.JoinHorizontal(lipgloss.Top, pinnedOne, "  ", pinnedTwo)
+
+	mainPanelsRaw := lipgloss.JoinHorizontal(lipgloss.Top, listBox, "  ", rightPanels)
+	mainPanelsWidth := lipgloss.Width(mainPanelsRaw)
+
+	mainPanelsTopGap := 1
+	if m.height > 0 {
+		cmdOuterWidth := lipgloss.Width(mainPanelsRaw)
+		cmdInnerWidth := max(8, cmdOuterWidth-4)
+		cmdInput := m.cmd
+		cmdInput.Width = max(6, cmdInnerWidth-2)
+		cmdLines := []string{}
+		if m.shouldShowCommandSuggestions() {
+			cmdLines = append(cmdLines, renderCommandSuggestionRows(cmdInnerWidth, m.commandSuggestions, m.commandSuggestionIndex, m.commandSuggestionOffset))
+		}
+		cmdLines = append(cmdLines, lipgloss.NewStyle().Width(cmdInnerWidth).Render(cmdInput.View()))
+		cmdInner := strings.Join(cmdLines, "\n")
+		bottomSection := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#6CBFE6")).
+			Padding(0, 1).
+			Render(cmdInner)
+
+		headerGap := 1
+		hasMessage := strings.TrimSpace(m.commandText) != ""
+		messageGap := 0
+		if hasMessage {
+			messageGap = 1
+		}
+
+		availableHeight := max(0, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+		coreHeight := lipgloss.Height(header) + lipgloss.Height(mainPanelsRaw) + lipgloss.Height(bottomSection) + headerGap
+		if hasMessage {
+			messageArea := lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#6CBFE6")).
+				Padding(0, 1).
+				Foreground(lipgloss.Color("#D4CDE9")).
+				Width(max(8, lipgloss.Width(mainPanelsRaw)-4)).
+				Render(m.commandText)
+			coreHeight += messageGap + lipgloss.Height(messageArea)
+		}
+		bridgeGap := max(1, availableHeight-coreHeight)
+		if coreHeight+bridgeGap > availableHeight {
+			headerGap = 0
+		}
+		mainPanelsTopGap = headerGap
+	}
+
+	bodyX := frame.GetHorizontalFrameSize()/2 + contentStyle.GetPaddingLeft()
+	bodyY := frame.GetVerticalFrameSize()/2 + contentStyle.GetPaddingTop()
+	mainPanelsX := bodyX + max(0, (layoutWidth-mainPanelsWidth)/2)
+	mainPanelsY := bodyY + lipgloss.Height(header) + mainPanelsTopGap
+
+	leftPanelX := mainPanelsX + lipgloss.Width(listBox) + 2
+	secondPanelX := leftPanelX + lipgloss.Width(pinnedOne) + 2
+	buttonXOffset := 2 + lipgloss.Width(pinTitle+" ")
+	buttonY := mainPanelsY + 1
+	buttonW := lipgloss.Width("[select view]")
+
+	return []hitRect{
+		{x: leftPanelX + buttonXOffset, y: buttonY, w: buttonW, h: 1},
+		{x: secondPanelX + buttonXOffset, y: buttonY, w: buttonW, h: 1},
+	}
 }
