@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -30,6 +32,15 @@ type savePATMsg struct {
 	err error
 }
 
+type clearCommandTextMsg struct {
+	id int
+}
+
+type commandSpec struct {
+	name        string
+	description string
+}
+
 type model struct {
 	width  int
 	height int
@@ -39,17 +50,24 @@ type model struct {
 	cmd       textinput.Model
 	pat       textinput.Model
 
-	status       connectionState
-	statusDetail string
+	status                  connectionState
+	statusDetail            string
+	commandText             string
+	commandTextID           int
+	commandSuggestions      []commandSpec
+	commandSuggestionIndex  int
+	commandSuggestionOffset int
 
-	showPATPrompt bool
-	quitting      bool
+	showHelpOverlay bool
+	showPATPrompt   bool
+	quitting        bool
 }
 
 func New() tea.Model {
 	cmd := textinput.New()
 	cmd.Prompt = "> "
 	cmd.Placeholder = "/help"
+	cmd.Width = 72
 	cmd.Focus()
 
 	pat := textinput.New()
@@ -64,13 +82,13 @@ func New() tea.Model {
 			"Transactions",
 			"Spend Categories",
 			"Pay Cycle Burndown",
-			"Settings",
 		},
 		selected:     0,
 		cmd:          cmd,
 		pat:          pat,
 		status:       stateChecking,
 		statusDetail: "Checking connection...",
+		commandText:  "",
 	}
 }
 
@@ -83,6 +101,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.cmd.Width = max(40, msg.Width-36)
+		m.pat.Width = max(24, msg.Width-40)
 		return m, nil
 
 	case checkConnectionMsg:
@@ -111,7 +131,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusDetail = "Checking connection..."
 		return m, checkConnectionCmd
 
+	case clearCommandTextMsg:
+		if msg.id == m.commandTextID {
+			m.commandText = ""
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		if m.showHelpOverlay {
+			switch msg.String() {
+			case "esc":
+				m.showHelpOverlay = false
+				return m, nil
+			case "ctrl+c", "q":
+				m.quitting = true
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+
 		if m.showPATPrompt {
 			switch msg.String() {
 			case "esc":
@@ -133,10 +171,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "up", "k":
+			if m.shouldShowCommandSuggestions() {
+				if m.commandSuggestionIndex > 0 {
+					m.commandSuggestionIndex--
+				}
+				m.adjustSuggestionWindow(2)
+				return m, nil
+			}
 			if m.selected > 0 {
 				m.selected--
 			}
 		case "down", "j":
+			if m.shouldShowCommandSuggestions() {
+				if m.commandSuggestionIndex < len(m.commandSuggestions)-1 {
+					m.commandSuggestionIndex++
+				}
+				m.adjustSuggestionWindow(2)
+				return m, nil
+			}
 			if m.selected < len(m.viewItems)-1 {
 				m.selected++
 			}
@@ -145,15 +197,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showPATPrompt = true
 				m.pat.Focus()
 				m.cmd.Blur()
+				m.clearCommandSuggestions()
 				return m, nil
 			}
 		case "enter":
-			return m.runSlashCommand(strings.TrimSpace(m.cmd.Value()))
+			input := strings.TrimSpace(m.cmd.Value())
+			if m.shouldShowCommandSuggestions() {
+				input = m.commandSuggestions[m.commandSuggestionIndex].name
+			}
+			return m.runSlashCommand(input)
+		}
+		if m.commandText != "" {
+			switch msg.Type {
+			case tea.KeyRunes, tea.KeySpace, tea.KeyBackspace, tea.KeyDelete:
+				m.commandText = ""
+			}
 		}
 	}
 
 	var cmd tea.Cmd
 	m.cmd, cmd = m.cmd.Update(msg)
+	m.refreshCommandSuggestions()
 	return m, cmd
 }
 
@@ -162,9 +226,25 @@ func (m model) View() string {
 		return ""
 	}
 
+	frame := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#F47A60")).
+		Padding(1, 1)
+	// Keep top breathing room, but tighten bottom so CLI sits one row above the frame border.
+	contentStyle := lipgloss.NewStyle().Padding(1, 1, 0, 1)
+	if m.width > 0 {
+		frame = frame.Width(max(1, m.width-frame.GetHorizontalBorderSize()))
+	}
+	if m.height > 0 {
+		frame = frame.Height(max(1, m.height-frame.GetVerticalBorderSize()))
+	}
+
+	// Effective width available to body content after all outer frame and padding.
+	layoutWidth := max(1, m.width-frame.GetHorizontalFrameSize()-contentStyle.GetHorizontalFrameSize())
+
 	header := renderBlockTitle()
 	if m.width > 0 {
-		header = lipgloss.PlaceHorizontal(max(0, m.width-4), lipgloss.Center, header)
+		header = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, header)
 	}
 	header = lipgloss.NewStyle().PaddingBottom(1).Render(header)
 
@@ -173,42 +253,125 @@ func (m model) View() string {
 	if m.status == stateConnected {
 		statusColor = lipgloss.Color("#5CCB76")
 	}
-	statusLine := lipgloss.NewStyle().Bold(true).Render("Status: ") +
+	statusLine := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("Status: ") +
 		lipgloss.NewStyle().Foreground(statusColor).Render(statusDot) + " " + m.statusDetail
 
-	if m.status == stateDisconnected {
-		statusLine += "  " + lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#F47A60")).
-			Bold(true).
-			Render("[ Connect: press c ]")
-	}
-
+	listWidth := 24
+	rightWidth := max(36, m.width-listWidth-20)
+	panelHeight := 14
 	listBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#F47A60")).
 		Padding(0, 1).
-		Render(renderViews(m.viewItems, m.selected))
+		Height(panelHeight).
+		Width(listWidth).
+		Render(renderViews(m.viewItems, m.selected, statusLine, m.status == stateDisconnected))
 
-	helpLine := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#F6C34A")).
-		Render("Type /help for commands")
+	panelWidth := max(18, (rightWidth-2)/2)
+	pinnedStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#FFD54A")).
+		Padding(0, 1).
+		Width(panelWidth).
+		Height(panelHeight)
+	pinTitle := pinIconOrFallback()
+	selectButton := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFD54A")).
+		Bold(true).
+		Render("[select view]")
+	cardHeader := pinTitle + " " + selectButton
+	pinnedOne := pinnedStyle.Render(cardHeader)
+	pinnedTwo := pinnedStyle.Render(cardHeader)
+	rightPanels := lipgloss.JoinHorizontal(lipgloss.Top, pinnedOne, "  ", pinnedTwo)
+	canvasWidth := layoutWidth
+	mainPanelsRaw := lipgloss.JoinHorizontal(lipgloss.Top, listBox, "  ", rightPanels)
+	mainPanelsWidth := lipgloss.Width(mainPanelsRaw)
+	mainPanels := lipgloss.PlaceHorizontal(canvasWidth, lipgloss.Center, mainPanelsRaw)
 
-	cmdBox := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
+	messageArea := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#6CBFE6")).
 		Padding(0, 1).
-		Render(m.cmd.View())
-
-	body := []string{
-		header,
-		"",
-		statusLine,
-		"",
-		listBox,
-		"",
-		helpLine,
-		cmdBox,
+		Foreground(lipgloss.Color("#D4CDE9")).
+		Width(max(8, mainPanelsWidth-4)).
+		Render(m.commandText)
+	if strings.TrimSpace(m.commandText) == "" {
+		messageArea = ""
+	} else {
+		messageArea = lipgloss.PlaceHorizontal(canvasWidth, lipgloss.Center, messageArea)
 	}
+
+	cmdOuterWidth := mainPanelsWidth
+	cmdInnerWidth := max(8, cmdOuterWidth-4)
+	cmdInput := m.cmd
+	cmdInput.Width = max(6, cmdInnerWidth-2)
+	cmdLines := []string{}
+	if m.shouldShowCommandSuggestions() {
+		cmdLines = append(cmdLines, renderCommandSuggestionRows(cmdInnerWidth, m.commandSuggestions, m.commandSuggestionIndex, m.commandSuggestionOffset))
+	}
+	cmdLines = append(cmdLines, lipgloss.NewStyle().Width(cmdInnerWidth).Render(cmdInput.View()))
+	cmdInner := strings.Join(cmdLines, "\n")
+
+	cmdBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#6CBFE6")).
+		Padding(0, 1).
+		Render(cmdInner)
+	cmdBox = lipgloss.PlaceHorizontal(canvasWidth, lipgloss.Center, cmdBox)
+	bottomSection := cmdBox
+
+	headerGap := 1
+	hasMessage := strings.TrimSpace(m.commandText) != ""
+	messageGap := 0
+	if hasMessage {
+		messageGap = 1
+	}
+
+	bridgeMin := 1
+	bridgeGap := bridgeMin
+	if m.height > 0 {
+		availableHeight := max(0, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+
+		coreHeight := lipgloss.Height(header) + lipgloss.Height(mainPanels) + lipgloss.Height(bottomSection) + headerGap
+		if hasMessage {
+			coreHeight += messageGap + lipgloss.Height(messageArea)
+		}
+
+		// Keep the cards->CLI gap as the primary compression buffer.
+		bridgeGap = max(bridgeMin, availableHeight-coreHeight)
+		if coreHeight+bridgeGap > availableHeight {
+			// Once bridge has reached its minimum, collapse secondary blank space.
+			headerGap = 0
+			coreHeight = lipgloss.Height(header) + lipgloss.Height(mainPanels) + lipgloss.Height(bottomSection)
+			if hasMessage {
+				coreHeight += messageGap + lipgloss.Height(messageArea)
+			}
+		}
+		if coreHeight+bridgeGap > availableHeight {
+			// If space is still insufficient, allow bridge to collapse below 1.
+			bridgeGap = max(0, availableHeight-coreHeight)
+		}
+	}
+
+	topLines := []string{header}
+	if headerGap > 0 {
+		topLines = append(topLines, "")
+	}
+	topLines = append(topLines, mainPanels)
+	if hasMessage {
+		if messageGap > 0 {
+			topLines = append(topLines, "")
+		}
+		topLines = append(topLines, messageArea)
+	}
+	topSection := strings.Join(topLines, "\n")
+
+	bodyText := topSection
+	if bridgeGap > 0 {
+		// N blank rows are represented by N newlines between sections.
+		bodyText += "\n" + strings.Repeat("\n", bridgeGap-1)
+	}
+	bodyText += "\n" + bottomSection
 
 	if m.showPATPrompt {
 		prompt := lipgloss.NewStyle().
@@ -216,12 +379,19 @@ func (m model) View() string {
 			BorderForeground(lipgloss.Color("#FFD54A")).
 			Padding(1, 2).
 			Render("Connect to Up\n\n" + m.pat.View() + "\n\nEnter to save, Esc to cancel")
-		body = append(body, "", prompt)
+		bodyText += "\n\n" + prompt
 	}
 
-	return lipgloss.NewStyle().
-		Padding(2, 2).
-		Render(strings.Join(body, "\n"))
+	content := contentStyle.Render(bodyText)
+
+	if m.showHelpOverlay {
+		helpOverlay := renderHelpOverlay(layoutWidth)
+		layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+		centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+		return frame.Render(contentStyle.Render(centered))
+	}
+
+	return frame.Render(content)
 }
 
 func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
@@ -229,25 +399,39 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 	case "":
 		return m, nil
 	case "/help":
-		m.statusDetail = "Commands: /help /accounts /transactions /settings /connect"
+		m.showHelpOverlay = true
+		m.commandText = ""
+		m.cmd.SetValue("")
+		m.clearCommandSuggestions()
+		return m, nil
 	case "/accounts":
 		m.selected = 0
-		m.statusDetail = "Accounts view selected"
+		return m.withCommandFeedback("Accounts view selected")
 	case "/transactions":
 		m.selected = 1
-		m.statusDetail = "Transactions view selected"
+		return m.withCommandFeedback("Transactions view selected")
 	case "/settings":
-		m.selected = 4
-		m.statusDetail = "Settings view selected"
+		return m.withCommandFeedback("Settings has been removed from the views list.")
 	case "/connect":
 		m.showPATPrompt = true
 		m.pat.Focus()
 		m.cmd.Blur()
+		m.clearCommandSuggestions()
+		return m.withCommandFeedback("Enter your PAT in the prompt to connect.")
 	default:
-		m.statusDetail = fmt.Sprintf("Unknown command: %s", input)
+		return m.withCommandFeedback(fmt.Sprintf("Unknown command: %s", input))
 	}
+}
+
+func (m model) withCommandFeedback(text string) (tea.Model, tea.Cmd) {
+	m.commandText = text
+	m.commandTextID++
 	m.cmd.SetValue("")
-	return m, nil
+	m.clearCommandSuggestions()
+	id := m.commandTextID
+	return m, tea.Tick(4*time.Second, func(time.Time) tea.Msg {
+		return clearCommandTextMsg{id: id}
+	})
 }
 
 func checkConnectionCmd() tea.Msg {
@@ -280,14 +464,28 @@ func max(a, b int) int {
 	return b
 }
 
-func renderViews(items []string, selected int) string {
-	lines := []string{"Views", ""}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func canvasSafeWidth(width int) int {
+	return max(20, width-10)
+}
+
+func renderViews(items []string, selected int, statusLine string, disconnected bool) string {
+	lines := []string{statusLine, ""}
 	for i, item := range items {
 		prefix := "  "
 		if i == selected {
 			prefix = "> "
 		}
 		lines = append(lines, prefix+item)
+	}
+	if disconnected {
+		lines = append(lines, "", "[c to connect]")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -362,4 +560,137 @@ func segmentForIndex(index int, segments [][2]int) int {
 		}
 	}
 	return 0
+}
+
+func pinIconOrFallback() string {
+	// Set GIDDYUP_DISABLE_NERD_FONT=1 to force ASCII fallback.
+	if os.Getenv("GIDDYUP_DISABLE_NERD_FONT") == "1" {
+		return "PIN"
+	}
+	return "\uf435"
+}
+
+func commandCatalog() []commandSpec {
+	return []commandSpec{
+		{name: "/help", description: "Show command help overlay"},
+		{name: "/accounts", description: "Select the Accounts view"},
+		{name: "/transactions", description: "Select the Transactions view"},
+		{name: "/connect", description: "Open the PAT connect prompt"},
+		{name: "/settings", description: "Legacy command (removed view)"},
+	}
+}
+
+func (m *model) refreshCommandSuggestions() {
+	input := strings.TrimSpace(m.cmd.Value())
+	if !strings.HasPrefix(input, "/") {
+		m.clearCommandSuggestions()
+		return
+	}
+
+	prefix := strings.ToLower(input)
+	all := commandCatalog()
+	matches := make([]commandSpec, 0, len(all))
+	for _, cmd := range all {
+		if strings.HasPrefix(cmd.name, prefix) {
+			matches = append(matches, cmd)
+		}
+	}
+	if len(matches) == 0 {
+		m.clearCommandSuggestions()
+		return
+	}
+
+	m.commandSuggestions = matches
+	if m.commandSuggestionIndex >= len(m.commandSuggestions) {
+		m.commandSuggestionIndex = len(m.commandSuggestions) - 1
+	}
+	if m.commandSuggestionIndex < 0 {
+		m.commandSuggestionIndex = 0
+	}
+	m.adjustSuggestionWindow(2)
+}
+
+func (m *model) clearCommandSuggestions() {
+	m.commandSuggestions = nil
+	m.commandSuggestionIndex = 0
+	m.commandSuggestionOffset = 0
+}
+
+func (m model) shouldShowCommandSuggestions() bool {
+	return strings.HasPrefix(strings.TrimSpace(m.cmd.Value()), "/") && len(m.commandSuggestions) > 0
+}
+
+func (m *model) adjustSuggestionWindow(visibleRows int) {
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+	if m.commandSuggestionIndex < m.commandSuggestionOffset {
+		m.commandSuggestionOffset = m.commandSuggestionIndex
+	}
+	if m.commandSuggestionIndex >= m.commandSuggestionOffset+visibleRows {
+		m.commandSuggestionOffset = m.commandSuggestionIndex - visibleRows + 1
+	}
+	maxOffset := max(0, len(m.commandSuggestions)-visibleRows)
+	if m.commandSuggestionOffset > maxOffset {
+		m.commandSuggestionOffset = maxOffset
+	}
+}
+
+func renderCommandSuggestionRows(innerWidth int, matches []commandSpec, selectedIndex int, offset int) string {
+	visibleRows := 2
+	start := max(0, min(offset, max(0, len(matches)-1)))
+	end := min(len(matches), start+visibleRows)
+
+	rows := make([]string, 0, end-start)
+	baseRow := lipgloss.NewStyle().
+		Background(lipgloss.Color("#1B2330")).
+		Width(innerWidth)
+	selectedRow := lipgloss.NewStyle().
+		Background(lipgloss.Color("#263249")).
+		Width(innerWidth)
+	for i := start; i < end; i++ {
+		cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#B9B4D0"))
+		descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8D88A8"))
+		prefix := "  "
+		rowStyle := baseRow
+		if i == selectedIndex {
+			prefix = "› "
+			cmdStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD54A")).Bold(true)
+			descStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#D4CDE9"))
+			rowStyle = selectedRow
+		}
+		row := prefix + cmdStyle.Render(matches[i].name) + "  " + descStyle.Render(matches[i].description)
+		rows = append(rows, rowStyle.Render(row))
+	}
+
+	return strings.Join(rows, "\n")
+}
+
+func renderHelpOverlay(maxWidth int) string {
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#5FA8FF")).
+		Bold(true).
+		Render("Command Help")
+
+	catalog := commandCatalog()
+	commands := make([]string, 0, len(catalog))
+	for _, cmd := range catalog {
+		commands = append(commands, fmt.Sprintf("%-13s %s", cmd.name, cmd.description))
+	}
+	body := strings.Join(commands, "\n")
+	footer := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFD54A")).
+		Bold(true).
+		Render("Esc to close")
+
+	content := strings.Join([]string{title, "", body, "", footer}, "\n")
+	panelWidth := min(maxWidth-6, 64)
+	panelWidth = max(36, panelWidth)
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#6CBFE6")).
+		Padding(1, 2).
+		Width(panelWidth).
+		Render(content)
 }
