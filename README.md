@@ -84,6 +84,40 @@ GIDDYUP_KEYCHAIN_SERVICE=my-service GIDDYUP_KEYCHAIN_ACCOUNT=my-account go run .
 
 Do not pass PAT as a CLI argument (for example `--pat=...`), because command-line arguments can be exposed in shell history and process listings.
 
+## Local database
+
+Initialize local database storage:
+
+```bash
+go run ./cmd/giddyup
+```
+
+The app auto-initializes the database on normal startup if it does not already exist.
+
+Delete local stored database data:
+
+```bash
+go run ./cmd/giddyup db wipe
+```
+
+Storage modes:
+
+- `secure` mode only: encrypted-at-rest SQLite (SQLCipher), with DB key stored in system keychain.
+
+Build requirement:
+
+```bash
+go build -tags sqlcipher ./cmd/giddyup
+```
+
+If the app is run on a build without SQLCipher support, startup fails with a clear error.
+
+Optional DB path override:
+
+```bash
+GIDDYUP_DB_PATH=/custom/path/giddyup.db go run ./cmd/giddyup db wipe
+```
+
 ## Pre-commit secret scanning
 
 Install `gitleaks`:
