@@ -10,8 +10,10 @@ import (
 	"os"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lachiem1/giddyUp/internal/auth"
 	"github.com/lachiem1/giddyUp/internal/storage"
+	"github.com/lachiem1/giddyUp/internal/tui"
 	"github.com/lachiem1/giddyUp/internal/upapi"
 	"golang.org/x/term"
 )
@@ -60,12 +62,21 @@ func main() {
 
 	pat, err := auth.LoadPAT()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "auth setup error: %v\n", err)
-		os.Exit(1)
+		// TUI can still guide auth setup interactively.
+		_ = err
 	}
 
-	// Do not print token value.
-	fmt.Printf("PAT loaded successfully (%d chars).\n", len(pat))
+	if pat != "" {
+		if _, _, err := initDB(); err != nil {
+			fmt.Fprintf(os.Stderr, "db setup error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if err := runTUI(); err != nil {
+		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func runPing() error {
@@ -98,6 +109,17 @@ func runWipeDB() error {
 
 func initDB() (*sql.DB, storage.Config, error) {
 	return storage.Open(context.Background())
+}
+
+func runTUI() error {
+	program := tea.NewProgram(
+		tui.New(), 
+		tea.WithAltScreen(), 
+		tea.WithMouseCellMotion(),
+	)
+
+	_, err := program.Run()
+	return err
 }
 
 func runAuthSet() error {

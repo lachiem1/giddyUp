@@ -8,6 +8,20 @@
 
 Giddy Up is a way for Up customers to view and track their own budget and spending via a Terminal User Interface (TUI). More to come.
 
+Running `giddyup` launches the main TUI screen.
+
+For a local release-like development loop:
+
+```bash
+make dev-release
+```
+
+Build only:
+
+```bash
+make release-build
+```
+
 ## Up API acceptable use
 
 This product is designed for personal, local use only:
