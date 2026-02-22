@@ -43,14 +43,16 @@ Giddy Up does not run a backend service for user data. API calls are made direct
 
 This project does not use `.env` files for secrets.
 
-Set your PAT once with:
+Set your PAT from inside the TUI:
 
 ```bash
-go run ./cmd/giddyup auth set
+go run ./cmd/giddyup
 ```
 
-The command prompts for your PAT with hidden input and stores it in your OS credential store.
-`giddyup auth set` stores the PAT locally in the user's system keychain only. At no point is the PAT sent to any server or third-party service.
+Then enter `/connect` in the command input at the bottom.
+The TUI prompts for your PAT with hidden input and stores it in your OS credential store.
+PAT storage happens locally in the user's system keychain only. At no point is the PAT sent to any server or third-party service.
+To remove a saved PAT from keychain, use `/disconnect` in the same command input.
 At runtime, PAT loading order is:
 
 1. `UP_PAT` environment variable, if set.
@@ -62,13 +64,7 @@ Run the app (it reads Keychain automatically):
 go run ./cmd/giddyup
 ```
 
-Verify API connectivity:
-
-```bash
-go run ./cmd/giddyup ping
-```
-
-The command prints `connected successfully` only when `/util/ping` returns HTTP 200.
+Verify API connectivity by entering `/ping` in the TUI command input.
 
 ## Up API client layout
 
@@ -112,8 +108,10 @@ The app auto-initializes the database on normal startup if it does not already e
 Delete local stored database data:
 
 ```bash
-go run ./cmd/giddyup db wipe
+go run ./cmd/giddyup
 ```
+
+Then enter `/db-wipe` (or `/db wipe`) in the TUI command input.
 
 Storage modes:
 
@@ -130,8 +128,10 @@ If the app is run on a build without SQLCipher support, startup fails with a cle
 Optional DB path override:
 
 ```bash
-GIDDYUP_DB_PATH=/custom/path/giddyup.db go run ./cmd/giddyup db wipe
+GIDDYUP_DB_PATH=/custom/path/giddyup.db go run ./cmd/giddyup
 ```
+
+Then enter `/db-wipe` in the TUI command input.
 
 Default DB path (when `GIDDYUP_DB_PATH` is not set):
 
