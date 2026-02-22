@@ -14,3 +14,8 @@ dist/
 # Local planning docs (do not commit)
 product-roadmap.md
 AGENTS.md
+
+# Local SQLite
+*.db
+*.db-shm
+*.db-wal
