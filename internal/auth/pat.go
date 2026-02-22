@@ -16,8 +16,9 @@ const (
 )
 
 var (
-	keyringGet = keyring.Get
-	keyringSet = keyring.Set
+	keyringGet    = keyring.Get
+	keyringSet    = keyring.Set
+	keyringDelete = keyring.Delete
 )
 
 // LoadPAT loads the Up Personal Access Token.
@@ -62,6 +63,43 @@ func SavePAT(pat string) error {
 	}
 
 	return nil
+}
+
+// RemovePAT deletes the stored Up PAT from the system credential store.
+func RemovePAT() error {
+	service := envOrDefault("GIDDYUP_KEYCHAIN_SERVICE", defaultSecretService)
+	account := envOrDefault("GIDDYUP_KEYCHAIN_ACCOUNT", defaultSecretUser)
+
+	if err := keyringDelete(service, account); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return fmt.Errorf(
+			"failed to delete keyring item service=%q account=%q: %w",
+			service,
+			account,
+			err,
+		)
+	}
+	return nil
+}
+
+// HasStoredPAT reports whether a non-empty PAT exists in the system keychain.
+func HasStoredPAT() (bool, error) {
+	service := envOrDefault("GIDDYUP_KEYCHAIN_SERVICE", defaultSecretService)
+	account := envOrDefault("GIDDYUP_KEYCHAIN_ACCOUNT", defaultSecretUser)
+
+	secret, err := keyringGet(service, account)
+	if err != nil {
+		if errors.Is(err, keyring.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf(
+			"failed to read keyring item service=%q account=%q: %w",
+			service,
+			account,
+			err,
+		)
+	}
+
+	return strings.TrimSpace(secret) != "", nil
 }
 
 // LoadDBKey loads the locally stored database key from keyring.
