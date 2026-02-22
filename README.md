@@ -2,9 +2,10 @@
 
 **Unofficial product: Giddy Up is not affiliated with, endorsed by, sponsored by, or connected to Up in any way.**
 
+
 <p align="center">
-    <img width="464" height="560" alt="GiddyUp Logo" src="https://github.com/user-attachments/assets/cef765bd-1f9e-4c35-8aee-933d35f75f1c" />
-  </p>
+    <img width="464" height="407" alt="giddyup_logo_big" src="https://github.com/user-attachments/assets/23b6293f-d843-48e0-a0e1-3fe3be95e3b9" />
+</p>
 
 Giddy Up is a way for Up customers to view and track their own budget and spending via a Terminal User Interface (TUI). More to come.
 
