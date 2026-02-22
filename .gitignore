@@ -5,6 +5,7 @@
 # Build artifacts
 bin/
 dist/
+/giddyup
 *.exe
 *.out
 
@@ -15,6 +16,7 @@ dist/
 product-roadmap.md
 AGENTS.md
 tui-plan.md
+/skills
 
 # Local SQLite
 *.db
