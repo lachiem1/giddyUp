@@ -83,14 +83,19 @@ func configFromEnv() (Config, error) {
 		}, nil
 	}
 
-	homeDir, err := os.UserHomeDir()
+	exePath, err := os.Executable()
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve home dir: %w", err)
+		return Config{}, fmt.Errorf("resolve executable path: %w", err)
 	}
+	resolvedExePath, err := filepath.EvalSymlinks(exePath)
+	if err == nil {
+		exePath = resolvedExePath
+	}
+	exeDir := filepath.Dir(exePath)
 
 	return Config{
 		Mode: ModeSecure,
-		Path: filepath.Join(homeDir, "Library", "Application Support", "giddyup", "giddyup.db"),
+		Path: filepath.Join(exeDir, "giddyup.db"),
 	}, nil
 }
 

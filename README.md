@@ -118,6 +118,10 @@ Optional DB path override:
 GIDDYUP_DB_PATH=/custom/path/giddyup.db go run ./cmd/giddyup db wipe
 ```
 
+Default DB path (when `GIDDYUP_DB_PATH` is not set):
+
+- `<directory containing the giddyup executable>/giddyup.db`
+
 ## Pre-commit secret scanning
 
 Install `gitleaks`:
