@@ -12,6 +12,7 @@ import (
 const (
 	defaultSecretService = "giddyup"
 	defaultSecretUser    = "up_pat"
+	defaultDBKeyUser     = "db_key"
 )
 
 var (
@@ -50,6 +51,46 @@ func SavePAT(pat string) error {
 
 	service := envOrDefault("GIDDYUP_KEYCHAIN_SERVICE", defaultSecretService)
 	account := envOrDefault("GIDDYUP_KEYCHAIN_ACCOUNT", defaultSecretUser)
+
+	if err := keyringSet(service, account, trimmed); err != nil {
+		return fmt.Errorf(
+			"failed to store keyring item service=%q account=%q: %w",
+			service,
+			account,
+			err,
+		)
+	}
+
+	return nil
+}
+
+// LoadDBKey loads the locally stored database key from keyring.
+func LoadDBKey() (string, error) {
+	service := envOrDefault("GIDDYUP_KEYCHAIN_SERVICE", defaultSecretService)
+	account := envOrDefault("GIDDYUP_DB_KEY_ACCOUNT", defaultDBKeyUser)
+
+	secret, err := keyringGet(service, account)
+	if err != nil {
+		return "", fmt.Errorf(
+			"failed to read keyring item service=%q account=%q: %w",
+			service,
+			account,
+			err,
+		)
+	}
+
+	return strings.TrimSpace(secret), nil
+}
+
+// SaveDBKey stores the database key in keyring.
+func SaveDBKey(key string) error {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return errors.New("database key cannot be empty")
+	}
+
+	service := envOrDefault("GIDDYUP_KEYCHAIN_SERVICE", defaultSecretService)
+	account := envOrDefault("GIDDYUP_DB_KEY_ACCOUNT", defaultDBKeyUser)
 
 	if err := keyringSet(service, account, trimmed); err != nil {
 		return fmt.Errorf(
