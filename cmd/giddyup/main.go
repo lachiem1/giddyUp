@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/lachiem1/giddyUp/internal/auth"
+	"github.com/lachiem1/giddyUp/internal/storage"
 	"github.com/lachiem1/giddyUp/internal/upapi"
 	"golang.org/x/term"
 )
@@ -35,7 +37,25 @@ func main() {
 			}
 			fmt.Println("connected successfully")
 			return
+		case "wipe":
+			fmt.Fprintln(os.Stderr, "usage: giddyup db wipe")
+			os.Exit(1)
+		case "db":
+			if len(os.Args) >= 3 && os.Args[2] == "wipe" {
+				if err := runWipeDB(); err != nil {
+					fmt.Fprintf(os.Stderr, "db wipe error: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+			fmt.Fprintln(os.Stderr, "usage: giddyup db wipe")
+			os.Exit(1)
 		}
+	}
+
+	if _, _, err := initDB(); err != nil {
+		fmt.Fprintf(os.Stderr, "db setup error: %v\n", err)
+		os.Exit(1)
 	}
 
 	pat, err := auth.LoadPAT()
@@ -60,6 +80,24 @@ func runPing() error {
 
 	client := upapi.New(pat)
 	return client.Ping(context.Background())
+}
+
+func runWipeDB() error {
+	if len(os.Args) != 3 {
+		return errors.New("usage: giddyup db wipe")
+	}
+
+	cfg, err := storage.Wipe()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("database wiped (%s mode): %s\n", cfg.Mode, cfg.Path)
+	return nil
+}
+
+func initDB() (*sql.DB, storage.Config, error) {
+	return storage.Open(context.Background())
 }
 
 func runAuthSet() error {
