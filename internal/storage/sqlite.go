@@ -20,6 +20,8 @@ const (
 	ModeSecure Mode = "secure"
 )
 
+const schemaVersion = 2
+
 type Config struct {
 	Mode Mode
 	Path string
@@ -125,7 +127,7 @@ func generateRandomKey() (string, error) {
 }
 
 func runMigrations(ctx context.Context, db *sql.DB) error {
-	const schema = `
+	const bootstrapSchema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
@@ -133,8 +135,91 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 INSERT OR IGNORE INTO schema_migrations (id, version) VALUES (1, 1);
 `
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+	if _, err := db.ExecContext(ctx, bootstrapSchema); err != nil {
 		return fmt.Errorf("run sqlite migrations: %w", err)
+	}
+
+	var currentVersion int
+	if err := db.QueryRowContext(ctx, "SELECT version FROM schema_migrations WHERE id = 1").Scan(&currentVersion); err != nil {
+		return fmt.Errorf("read sqlite schema version: %w", err)
+	}
+
+	if currentVersion < 2 {
+		if err := applyV2Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 2
+	}
+
+	if currentVersion > schemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", currentVersion, schemaVersion)
+	}
+
+	return nil
+}
+
+func applyV2Migrations(ctx context.Context, db *sql.DB) error {
+	const schema = `
+CREATE TABLE IF NOT EXISTS sync_state (
+  collection TEXT PRIMARY KEY,
+  last_success_at TEXT,
+  last_attempt_at TEXT,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  account_type TEXT NOT NULL,
+  ownership_type TEXT NOT NULL,
+  balance_currency_code TEXT NOT NULL,
+  balance_value TEXT NOT NULL,
+  balance_value_in_base_units INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  last_fetched_at TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_last_fetched_at ON accounts(last_fetched_at);
+CREATE INDEX IF NOT EXISTS idx_accounts_account_type ON accounts(account_type);
+CREATE INDEX IF NOT EXISTS idx_accounts_ownership_type ON accounts(ownership_type);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  description TEXT NOT NULL,
+  message TEXT,
+  amount_currency_code TEXT NOT NULL,
+  amount_value TEXT NOT NULL,
+  amount_value_in_base_units INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  settled_at TEXT,
+  last_fetched_at TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_account_id ON transactions(account_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
+`
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v2 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("run sqlite v2 migrations: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 2 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 2: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v2 migrations: %w", err)
 	}
 	return nil
 }
