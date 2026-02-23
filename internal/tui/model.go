@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -42,6 +43,36 @@ type wipeDBMsg struct {
 	err  error
 }
 
+type accountPreviewRow struct {
+	id           string
+	displayName  string
+	balanceValue string
+}
+
+type loadAccountsPreviewMsg struct {
+	rows          []accountPreviewRow
+	lastFetchedAt *time.Time
+	err           error
+}
+
+type syncAccountsPreviewMsg struct {
+	rows          []accountPreviewRow
+	lastFetchedAt *time.Time
+	err           error
+}
+
+type moveAccountMsg struct {
+	err error
+}
+
+type accountsClockTickMsg struct {
+	sessionID int
+}
+
+type accountsAutoRefreshTickMsg struct {
+	sessionID int
+}
+
 type clearCommandTextMsg struct {
 	id int
 }
@@ -71,6 +102,8 @@ const (
 )
 
 type model struct {
+	db *sql.DB
+
 	width  int
 	height int
 
@@ -93,10 +126,17 @@ type model struct {
 	authDialog      authDialogMode
 	screen          screenMode
 	connectHint     string
+	accountsRows    []accountPreviewRow
+	accountsFetched *time.Time
+	accountsErr     string
+	accountsLoading bool
+	accountsCursor  int
+	accountsOffset  int
+	accountsSession int
 	quitting        bool
 }
 
-func New() tea.Model {
+func New(db *sql.DB) tea.Model {
 	cmd := textinput.New()
 	cmd.Prompt = "> "
 	cmd.Placeholder = "/help"
@@ -110,6 +150,7 @@ func New() tea.Model {
 	pat.EchoCharacter = '•'
 
 	return model{
+		db: db,
 		viewItems: []string{
 			"accounts",
 			"transactions",
@@ -129,7 +170,7 @@ func New() tea.Model {
 }
 
 func (m model) Init() tea.Cmd {
-	return checkConnectionCmd
+	return tea.Batch(checkConnectionCmd, m.loadAccountsPreviewCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -183,6 +224,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.withCommandFeedback("db wipe failed: " + msg.err.Error())
 		}
 		return m.withCommandFeedback("local database wiped: " + msg.path)
+
+	case loadAccountsPreviewMsg:
+		if msg.err != nil {
+			if len(m.accountsRows) == 0 {
+				m.accountsErr = msg.err.Error()
+			}
+			return m, nil
+		}
+		m.accountsErr = ""
+		m.accountsRows = msg.rows
+		m.accountsFetched = msg.lastFetchedAt
+		if m.accountsCursor >= len(m.accountsRows) {
+			m.accountsCursor = max(0, len(m.accountsRows)-1)
+		}
+		m.ensureAccountsScrollWindow()
+		return m, nil
+
+	case syncAccountsPreviewMsg:
+		m.accountsLoading = false
+		if msg.err != nil {
+			if len(m.accountsRows) == 0 {
+				m.accountsErr = msg.err.Error()
+			}
+			return m, nil
+		}
+		m.accountsErr = ""
+		m.accountsRows = msg.rows
+		m.accountsFetched = msg.lastFetchedAt
+		if m.accountsCursor >= len(m.accountsRows) {
+			m.accountsCursor = max(0, len(m.accountsRows)-1)
+		}
+		m.ensureAccountsScrollWindow()
+		return m, nil
+
+	case moveAccountMsg:
+		if msg.err != nil {
+			if len(m.accountsRows) == 0 {
+				m.accountsErr = msg.err.Error()
+			}
+			return m, nil
+		}
+		return m, m.loadAccountsPreviewCmd()
+
+	case accountsClockTickMsg:
+		if msg.sessionID != m.accountsSession || m.screen != screenAccounts {
+			return m, nil
+		}
+		return m, m.accountsClockTickCmd()
+
+	case accountsAutoRefreshTickMsg:
+		if msg.sessionID != m.accountsSession || m.screen != screenAccounts {
+			return m, nil
+		}
+		return m, tea.Batch(
+			m.syncAndReloadAccountsPreviewCmd(true),
+			m.accountsAutoRefreshTickCmd(),
+		)
 
 	case clearCommandTextMsg:
 		if msg.id == m.commandTextID {
@@ -261,6 +359,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "shift+up":
+			if m.screen == screenAccounts && len(m.accountsRows) > 0 && m.accountsCursor > 0 {
+				m.accountsCursor--
+				m.ensureAccountsScrollWindow()
+				id := m.accountsRows[m.accountsCursor+1].id
+				return m, m.moveAccountCmd(id, -1)
+			}
+			return m, nil
+		case "shift+down":
+			if m.screen == screenAccounts && len(m.accountsRows) > 0 && m.accountsCursor < len(m.accountsRows)-1 {
+				m.accountsCursor++
+				m.ensureAccountsScrollWindow()
+				id := m.accountsRows[m.accountsCursor-1].id
+				return m, m.moveAccountCmd(id, +1)
+			}
+			return m, nil
 		case "ctrl+c", "q":
 			m.quitting = true
 			return m, tea.Quit
@@ -269,6 +383,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
 				m.screen = screenHome
+				m.accountsSession++
 				return m, nil
 			}
 			if strings.TrimSpace(m.cmd.Value()) != "" || m.shouldShowCommandSuggestions() {
@@ -277,6 +392,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
+			if m.screen == screenAccounts {
+				if m.accountsCursor > 0 {
+					m.accountsCursor--
+				}
+				m.ensureAccountsScrollWindow()
+				return m, nil
+			}
 			if m.shouldShowCommandSuggestions() {
 				if m.commandSuggestionIndex > 0 {
 					m.commandSuggestionIndex--
@@ -288,6 +410,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected--
 			}
 		case "down", "j":
+			if m.screen == screenAccounts {
+				if m.accountsCursor < len(m.accountsRows)-1 {
+					m.accountsCursor++
+				}
+				m.ensureAccountsScrollWindow()
+				return m, nil
+			}
 			if m.shouldShowCommandSuggestions() {
 				if m.commandSuggestionIndex < len(m.commandSuggestions)-1 {
 					m.commandSuggestionIndex++
@@ -303,8 +432,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() &&
 				m.selected == 0 {
-				m.screen = screenAccounts
-				return m, nil
+				return m.enterAccountsView()
 			}
 			input := strings.TrimSpace(m.cmd.Value())
 			if m.shouldShowCommandSuggestions() {
@@ -521,9 +649,7 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.clearCommandSuggestions()
 		return m, nil
 	case "/accounts":
-		m.selected = 0
-		m.screen = screenAccounts
-		return m, nil
+		return m.enterAccountsView()
 	case "/transactions":
 		m.selected = 1
 		m.screen = screenHome
@@ -571,6 +697,70 @@ func (m model) withCommandFeedback(text string) (tea.Model, tea.Cmd) {
 	return m, tea.Tick(4*time.Second, func(time.Time) tea.Msg {
 		return clearCommandTextMsg{id: id}
 	})
+}
+
+func (m model) enterAccountsView() (tea.Model, tea.Cmd) {
+	m.selected = 0
+	m.screen = screenAccounts
+	m.accountsErr = ""
+	m.accountsLoading = true
+	m.accountsSession++
+	return m, tea.Batch(
+		m.loadAccountsPreviewCmd(),
+		m.syncAndReloadAccountsPreviewCmd(false),
+		m.accountsClockTickCmd(),
+		m.accountsAutoRefreshTickCmd(),
+	)
+}
+
+func (m *model) ensureAccountsScrollWindow() {
+	visible := m.accountsVisibleRows()
+	if visible < 1 {
+		visible = 1
+	}
+	if m.accountsCursor < m.accountsOffset {
+		m.accountsOffset = m.accountsCursor
+	}
+	if m.accountsCursor >= m.accountsOffset+visible {
+		m.accountsOffset = m.accountsCursor - visible + 1
+	}
+	maxOffset := max(0, len(m.accountsRows)-visible)
+	if m.accountsOffset > maxOffset {
+		m.accountsOffset = maxOffset
+	}
+	if m.accountsOffset < 0 {
+		m.accountsOffset = 0
+	}
+}
+
+func (m model) accountsVisibleRows() int {
+	return 6
+}
+
+func (m model) accountsClockTickCmd() tea.Cmd {
+	session := m.accountsSession
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return accountsClockTickMsg{sessionID: session}
+	})
+}
+
+func (m model) accountsAutoRefreshTickCmd() tea.Cmd {
+	session := m.accountsSession
+	return tea.Tick(60*time.Second, func(time.Time) tea.Msg {
+		return accountsAutoRefreshTickMsg{sessionID: session}
+	})
+}
+
+func (m model) moveAccountCmd(accountID string, delta int) tea.Cmd {
+	return func() tea.Msg {
+		if m.db == nil {
+			return moveAccountMsg{err: fmt.Errorf("database is not initialized")}
+		}
+		if err := moveAccountDisplayOrder(context.Background(), m.db, accountID, delta); err != nil {
+			return moveAccountMsg{err: err}
+		}
+		return moveAccountMsg{}
+	}
 }
 
 func checkConnectionCmd() tea.Msg {
