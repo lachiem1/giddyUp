@@ -63,6 +63,13 @@ const (
 	authDialogDisconnect
 )
 
+type screenMode int
+
+const (
+	screenHome screenMode = iota
+	screenAccounts
+)
+
 type model struct {
 	width  int
 	height int
@@ -84,6 +91,7 @@ type model struct {
 
 	showHelpOverlay bool
 	authDialog      authDialogMode
+	screen          screenMode
 	connectHint     string
 	quitting        bool
 }
@@ -115,6 +123,7 @@ func New() tea.Model {
 		status:       stateChecking,
 		statusDetail: "not connected",
 		authDialog:   authDialogNone,
+		screen:       screenHome,
 		commandText:  "",
 	}
 }
@@ -191,6 +200,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showHelpOverlay || m.authDialog != authDialogNone {
 			return m, nil
 		}
+		if m.screen != screenHome {
+			return m, nil
+		}
 
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			clicked := m.selectButtonAt(msg.X, msg.Y)
@@ -253,6 +265,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "esc":
+			if m.screen == screenAccounts &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				m.screen = screenHome
+				return m, nil
+			}
 			if strings.TrimSpace(m.cmd.Value()) != "" || m.shouldShowCommandSuggestions() {
 				m.cmd.SetValue("")
 				m.clearCommandSuggestions()
@@ -266,7 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.adjustSuggestionWindow(2)
 				return m, nil
 			}
-			if m.selected > 0 {
+			if m.screen == screenHome && m.selected > 0 {
 				m.selected--
 			}
 		case "down", "j":
@@ -277,10 +295,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.adjustSuggestionWindow(2)
 				return m, nil
 			}
-			if m.selected < len(m.viewItems)-1 {
+			if m.screen == screenHome && m.selected < len(m.viewItems)-1 {
 				m.selected++
 			}
 		case "enter":
+			if m.screen == screenHome &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() &&
+				m.selected == 0 {
+				m.screen = screenAccounts
+				return m, nil
+			}
 			input := strings.TrimSpace(m.cmd.Value())
 			if m.shouldShowCommandSuggestions() {
 				input = m.commandSuggestions[m.commandSuggestionIndex].name
@@ -321,6 +346,22 @@ func (m model) View() string {
 
 	// Effective width available to body content after all outer frame and padding.
 	layoutWidth := max(1, m.width-frame.GetHorizontalFrameSize()-contentStyle.GetHorizontalFrameSize())
+	if m.screen == screenAccounts {
+		content := contentStyle.Render(m.renderAccountsScreen(layoutWidth))
+		if m.showHelpOverlay {
+			helpOverlay := renderHelpOverlay(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		if m.authDialog != authDialogNone {
+			authOverlay := m.renderAuthDialog(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		return frame.Render(content)
+	}
 
 	header := renderBlockTitle()
 	if m.width > 0 {
@@ -481,9 +522,11 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/accounts":
 		m.selected = 0
-		return m.withCommandFeedback("accounts view selected")
+		m.screen = screenAccounts
+		return m, nil
 	case "/transactions":
 		m.selected = 1
+		m.screen = screenHome
 		return m.withCommandFeedback("transactions view selected")
 	case "/ping":
 		next, cmd := m.withCommandFeedback("checking connection...")
@@ -618,10 +661,6 @@ func renderBlockTitle() string {
 		"  ╚═════╝ ╚═╝╚═════╝ ╚═════╝    ╚═╝        ╚═════╝ ╚═╝     ",
 	}
 
-	blue := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true)
-	coral := lipgloss.NewStyle().Foreground(lipgloss.Color("#F47A60")).Bold(true)
-	yellow := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD54A")).Bold(true)
-
 	// Approximate letter regions for "GIDDYUP" across the title width.
 	// Alternates coral/yellow per region.
 	segments := [][2]int{
@@ -633,38 +672,12 @@ func renderBlockTitle() string {
 		{42, 50}, // U
 		{51, 57}, // P
 	}
-
-	rows := make([]string, 0, len(raw))
-	for _, line := range raw {
-		runes := []rune(line)
-		var out strings.Builder
-		for idx, ch := range runes {
-			if ch == ' ' {
-				out.WriteRune(' ')
-				continue
-			}
-
-			if isStrokeRune(ch) {
-				out.WriteString(blue.Render(string(ch)))
-				continue
-			}
-
-			seg := segmentForIndex(idx, segments)
-			fill := coral
-			if seg%2 == 1 {
-				fill = yellow
-			}
-			out.WriteString(fill.Render(string(ch)))
-		}
-		rows = append(rows, out.String())
-	}
-
-	return strings.Join(rows, "\n")
+	return renderStyledBlockTitle(raw, segments)
 }
 
 func isStrokeRune(ch rune) bool {
 	switch ch {
-	case '╔', '╗', '╚', '╝', '║', '═':
+	case '╔', '╗', '╚', '╝', '║', '═', '┌', '┐', '└', '┘', '│', '─':
 		return true
 	default:
 		return false
