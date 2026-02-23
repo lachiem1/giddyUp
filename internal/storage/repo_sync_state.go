@@ -60,7 +60,9 @@ func (r *SyncStateRepo) Get(ctx context.Context, collection string) (SyncState, 
 }
 
 func (r *SyncStateRepo) RecordAttempt(ctx context.Context, collection string, at time.Time) error {
-	return r.upsert(ctx, collection, at, nil, nil)
+	// Clear previous error at the start of a new attempt.
+	msg := ""
+	return r.upsert(ctx, collection, at, nil, &msg)
 }
 
 func (r *SyncStateRepo) RecordSuccess(ctx context.Context, collection string, at time.Time) error {

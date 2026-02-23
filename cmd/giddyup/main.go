@@ -17,12 +17,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	if _, _, err := initDB(); err != nil {
+	db, _, err := initDB()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "db setup error: %v\n", err)
 		os.Exit(1)
 	}
+	defer db.Close()
 
-	if err := runTUI(); err != nil {
+	if err := runTUI(db); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 		os.Exit(1)
 	}
@@ -32,9 +34,9 @@ func initDB() (*sql.DB, storage.Config, error) {
 	return storage.Open(context.Background())
 }
 
-func runTUI() error {
+func runTUI(db *sql.DB) error {
 	program := tea.NewProgram(
-		tui.New(),
+		tui.New(db),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)

@@ -20,7 +20,7 @@ const (
 	ModeSecure Mode = "secure"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Config struct {
 	Mode Mode
@@ -85,19 +85,14 @@ func configFromEnv() (Config, error) {
 		}, nil
 	}
 
-	exePath, err := os.Executable()
+	configDir, err := os.UserConfigDir()
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve executable path: %w", err)
+		return Config{}, fmt.Errorf("resolve user config directory: %w", err)
 	}
-	resolvedExePath, err := filepath.EvalSymlinks(exePath)
-	if err == nil {
-		exePath = resolvedExePath
-	}
-	exeDir := filepath.Dir(exePath)
 
 	return Config{
 		Mode: ModeSecure,
-		Path: filepath.Join(exeDir, "giddyup.db"),
+		Path: filepath.Join(configDir, "giddyup", "giddyup.db"),
 	}, nil
 }
 
@@ -149,6 +144,12 @@ INSERT OR IGNORE INTO schema_migrations (id, version) VALUES (1, 1);
 			return err
 		}
 		currentVersion = 2
+	}
+	if currentVersion < 3 {
+		if err := applyV3Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 3
 	}
 
 	if currentVersion > schemaVersion {
@@ -222,6 +223,71 @@ CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_a
 		return fmt.Errorf("commit sqlite v2 migrations: %w", err)
 	}
 	return nil
+}
+
+func applyV3Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v3 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	hasDisplayOrder, err := tableHasColumn(ctx, tx, "accounts", "display_order")
+	if err != nil {
+		return err
+	}
+	if !hasDisplayOrder {
+		if _, err = tx.ExecContext(
+			ctx,
+			"ALTER TABLE accounts ADD COLUMN display_order INTEGER NOT NULL DEFAULT 2147483647",
+		); err != nil {
+			return fmt.Errorf("add accounts.display_order column: %w", err)
+		}
+	}
+	if _, err = tx.ExecContext(
+		ctx,
+		"CREATE INDEX IF NOT EXISTS idx_accounts_display_order ON accounts(display_order)",
+	); err != nil {
+		return fmt.Errorf("create accounts display_order index: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 3 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 3: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v3 migrations: %w", err)
+	}
+	return nil
+}
+
+func tableHasColumn(ctx context.Context, tx *sql.Tx, tableName, columnName string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return false, fmt.Errorf("query table info for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var ctype sql.NullString
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &defaultValue, &pk); err != nil {
+			return false, fmt.Errorf("scan table info for %s: %w", tableName, err)
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read table info rows for %s: %w", tableName, err)
+	}
+	return false, nil
 }
 
 func resetLocalDBFiles(path string) error {
