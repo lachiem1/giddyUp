@@ -29,7 +29,11 @@ type ListResponse struct {
 }
 
 func pageSizeQuery() url.Values {
+	return pageSizeQueryWithSize(defaultPageSize)
+}
+
+func pageSizeQueryWithSize(size int) url.Values {
 	query := url.Values{}
-	query.Set("page[size]", strconv.Itoa(defaultPageSize))
+	query.Set("page[size]", strconv.Itoa(size))
 	return query
 }
