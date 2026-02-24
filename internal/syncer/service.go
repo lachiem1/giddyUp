@@ -21,11 +21,3 @@ func (s *Service) LeaveView() {
 func (s *Service) RefreshAccounts() error {
 	return s.engine.ManualRefresh(CollectionAccounts)
 }
-
-func (s *Service) EnterTransactionsView(ctx context.Context) error {
-	return s.engine.EnterView(ctx, CollectionTransactions)
-}
-
-func (s *Service) RefreshTransactions() error {
-	return s.engine.ManualRefresh(CollectionTransactions)
-}
