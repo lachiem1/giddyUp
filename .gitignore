@@ -14,8 +14,9 @@ dist/
 
 # Local planning docs (do not commit)
 product-roadmap.md
-AGENTS.md
 tui-plan.md
+transactions-views.md
+AGENTS.md
 /skills
 
 # Local SQLite
