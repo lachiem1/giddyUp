@@ -96,16 +96,39 @@ type saveConfigMsg struct {
 }
 
 type transactionPreviewRow struct {
+	createdAt   string
+	merchant    string
 	id          string
 	rawText     string
 	description string
 	amountValue string
+	status      string
+	message     string
+	categoryID  string
+	cardMethod  string
+	noteText    string
+	accountName string
 }
 
 type loadTransactionsPreviewMsg struct {
 	rows          []transactionPreviewRow
 	lastFetchedAt *time.Time
+	totalCount    int
+	page          int
 	err           error
+}
+
+type loadTransactionsFiltersMsg struct {
+	fromDate        string
+	toDate          string
+	mode            int
+	quickIdx        int
+	includeInternal bool
+	err             error
+}
+
+type saveTransactionsFiltersMsg struct {
+	err error
 }
 
 type syncTransactionsDoneMsg struct {
@@ -158,11 +181,24 @@ const (
 	screenAccounts
 	screenConfig
 	screenTransactions
+	screenTransactionsFilters
 )
 
 const (
 	accountsFocusCards = iota
 	accountsFocusPane
+)
+
+const (
+	transactionsFocusFromDate = iota
+	transactionsFocusToDate
+	transactionsFocusQuickRange
+	transactionsFocusIncludeInternal
+)
+
+const (
+	transactionsFilterModeQuick = iota
+	transactionsFilterModeCustom
 )
 
 type model struct {
@@ -186,38 +222,54 @@ type model struct {
 	commandSuggestionIndex  int
 	commandSuggestionOffset int
 
-	showHelpOverlay      bool
-	authDialog           authDialogMode
-	screen               screenMode
-	connectHint          string
-	accountsRows         []accountPreviewRow
-	accountsFetched      *time.Time
-	accountsErr          string
-	accountsLoading      bool
-	accountsCursor       int
-	accountsOffset       int
-	accountsSession      int
-	accountsPaneOpen     bool
-	accountsPaneFocus    int
-	accountsAction       int
-	accountsGoalEditing  bool
-	accountsGoalErr      string
-	accountsGoalInput    textinput.Model
-	configNextPayDigits  string
-	configFrequencyIndex int
-	configLastSavedDate  string
-	configDateDirty      bool
-	configFocus          int
-	configErr            string
-	transactionsRows     []transactionPreviewRow
-	transactionsCursor   int
-	transactionsOffset   int
-	transactionsErr      string
-	transactionsFetched  *time.Time
-	transactionsSyncing  bool
-	transactionsSession  int
-	transactionsLastSync *time.Time
-	quitting             bool
+	showHelpOverlay             bool
+	authDialog                  authDialogMode
+	screen                      screenMode
+	connectHint                 string
+	accountsRows                []accountPreviewRow
+	accountsFetched             *time.Time
+	accountsErr                 string
+	accountsLoading             bool
+	accountsCursor              int
+	accountsOffset              int
+	accountsSession             int
+	accountsPaneOpen            bool
+	accountsPaneFocus           int
+	accountsAction              int
+	accountsGoalEditing         bool
+	accountsGoalErr             string
+	accountsGoalInput           textinput.Model
+	configNextPayDigits         string
+	configFrequencyIndex        int
+	configLastSavedDate         string
+	configDateDirty             bool
+	configFocus                 int
+	configErr                   string
+	transactionsRows            []transactionPreviewRow
+	transactionsCursor          int
+	transactionsOffset          int
+	transactionsErr             string
+	transactionsFetched         *time.Time
+	transactionsSyncing         bool
+	transactionsSession         int
+	transactionsLastSync        *time.Time
+	transactionsPage            int
+	transactionsPageSize        int
+	transactionsTotal           int
+	transactionsFromDate        string
+	transactionsToDate          string
+	transactionsQuickIdx        int
+	transactionsSortIdx         int
+	transactionsFocus           int
+	transactionsDateErr         string
+	transactionsFilterMode      int
+	transactionsIncludeInternal bool
+	transactionsPaneOpen        bool
+	transactionsCalendarOpen    bool
+	transactionsCalendarMonth   time.Time
+	transactionsCalendarCursor  time.Time
+	transactionsCalendarTarget  int
+	quitting                    bool
 }
 
 func New(db *sql.DB) tea.Model {
@@ -247,17 +299,20 @@ func New(db *sql.DB) tea.Model {
 			"spend categories",
 			"pay cycle burndown",
 		},
-		selected:             0,
-		clicked:              -1,
-		cmd:                  cmd,
-		pat:                  pat,
-		status:               stateChecking,
-		statusDetail:         "not connected",
-		authDialog:           authDialogNone,
-		screen:               screenHome,
-		commandText:          "",
-		accountsGoalInput:    goalInput,
-		configFrequencyIndex: 0,
+		selected:                    0,
+		clicked:                     -1,
+		cmd:                         cmd,
+		pat:                         pat,
+		status:                      stateChecking,
+		statusDetail:                "not connected",
+		authDialog:                  authDialogNone,
+		screen:                      screenHome,
+		commandText:                 "",
+		accountsGoalInput:           goalInput,
+		configFrequencyIndex:        0,
+		transactionsPageSize:        8,
+		transactionsFilterMode:      transactionsFilterModeQuick,
+		transactionsIncludeInternal: true,
 	}
 }
 
@@ -405,10 +460,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.transactionsErr = ""
 		m.transactionsRows = msg.rows
 		m.transactionsFetched = msg.lastFetchedAt
+		m.transactionsTotal = msg.totalCount
+		if msg.page >= 0 {
+			m.transactionsPage = msg.page
+		}
 		if m.transactionsCursor >= len(m.transactionsRows) {
 			m.transactionsCursor = max(0, len(m.transactionsRows)-1)
 		}
 		m.ensureTransactionsScrollWindow()
+		return m, nil
+
+	case loadTransactionsFiltersMsg:
+		if msg.err == nil {
+			m.transactionsFromDate = strings.TrimSpace(msg.fromDate)
+			m.transactionsToDate = strings.TrimSpace(msg.toDate)
+			if msg.mode == transactionsFilterModeCustom {
+				m.transactionsFilterMode = transactionsFilterModeCustom
+			} else {
+				m.transactionsFilterMode = transactionsFilterModeQuick
+			}
+			ranges := transactionsQuickRanges()
+			if msg.quickIdx >= 0 && msg.quickIdx < len(ranges) {
+				m.transactionsQuickIdx = msg.quickIdx
+			}
+			m.transactionsIncludeInternal = msg.includeInternal
+		}
+		return m, m.loadTransactionsPreviewCmd()
+
+	case saveTransactionsFiltersMsg:
+		if msg.err != nil {
+			m.transactionsErr = msg.err.Error()
+		}
 		return m, nil
 
 	case syncTransactionsDoneMsg:
@@ -421,19 +503,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadTransactionsPreviewCmd()
 
 	case transactionsReloadTickMsg:
-		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions || !m.transactionsSyncing {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) || !m.transactionsSyncing {
 			return m, nil
 		}
 		return m, tea.Batch(m.loadTransactionsPreviewCmd(), m.transactionsReloadTickCmd())
 
 	case transactionsClockTickMsg:
-		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) {
 			return m, nil
 		}
 		return m, m.transactionsClockTickCmd()
 
 	case transactionsAutoRefreshTickMsg:
-		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) {
 			return m, nil
 		}
 		next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
@@ -651,6 +733,123 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		if m.screen == screenTransactionsFilters &&
+			strings.TrimSpace(m.cmd.Value()) == "" &&
+			!m.shouldShowCommandSuggestions() &&
+			(m.transactionsFocus == transactionsFocusFromDate || m.transactionsFocus == transactionsFocusToDate) {
+			if m.transactionsCalendarOpen {
+				switch msg.String() {
+				case "shift+left":
+					m.transactionsCalendarCursor = shiftCalendarByMonths(m.transactionsCalendarCursor, -1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "shift+right":
+					m.transactionsCalendarCursor = shiftCalendarByMonths(m.transactionsCalendarCursor, 1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "shift+up":
+					m.transactionsCalendarCursor = shiftCalendarByYears(m.transactionsCalendarCursor, -1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "shift+down":
+					m.transactionsCalendarCursor = shiftCalendarByYears(m.transactionsCalendarCursor, 1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "left":
+					m.transactionsCalendarCursor = m.transactionsCalendarCursor.AddDate(0, 0, -1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "right":
+					m.transactionsCalendarCursor = m.transactionsCalendarCursor.AddDate(0, 0, 1)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "up":
+					m.transactionsCalendarCursor = m.transactionsCalendarCursor.AddDate(0, 0, -7)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "down":
+					m.transactionsCalendarCursor = m.transactionsCalendarCursor.AddDate(0, 0, 7)
+					m.transactionsCalendarMonth = time.Date(
+						m.transactionsCalendarCursor.Year(),
+						m.transactionsCalendarCursor.Month(),
+						1, 0, 0, 0, 0, time.Local,
+					)
+					return m, nil
+				case "enter":
+					digits := fmt.Sprintf("%04d%02d%02d",
+						m.transactionsCalendarCursor.Year(),
+						int(m.transactionsCalendarCursor.Month()),
+						m.transactionsCalendarCursor.Day(),
+					)
+					if m.transactionsCalendarTarget == transactionsFocusFromDate {
+						m.transactionsFromDate = digits
+					} else {
+						m.transactionsToDate = digits
+					}
+					m.transactionsFilterMode = transactionsFilterModeCustom
+					m.transactionsCalendarOpen = false
+					m.transactionsDateErr = ""
+					return m, nil
+				case "esc":
+					m.transactionsCalendarOpen = false
+					return m, nil
+				}
+			}
+			switch msg.Type {
+			case tea.KeyRunes:
+				if len(msg.Runes) > 0 {
+					d := msg.Runes[0]
+					if d >= '0' && d <= '9' {
+						if m.transactionsFocus == transactionsFocusFromDate {
+							m.transactionsFromDate = appendDateDigit(m.transactionsFromDate, d)
+						} else {
+							m.transactionsToDate = appendDateDigit(m.transactionsToDate, d)
+						}
+						m.transactionsFilterMode = transactionsFilterModeCustom
+						m.transactionsDateErr = ""
+						return m, nil
+					}
+				}
+			case tea.KeyBackspace, tea.KeyDelete:
+				if m.transactionsFocus == transactionsFocusFromDate {
+					m.transactionsFromDate = backspaceDateDigit(m.transactionsFromDate)
+				} else {
+					m.transactionsToDate = backspaceDateDigit(m.transactionsToDate)
+				}
+				m.transactionsFilterMode = transactionsFilterModeCustom
+				m.transactionsDateErr = ""
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "shift+up":
 			if m.screen == screenAccounts &&
@@ -677,6 +876,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "tab":
+			if m.screen == screenTransactionsFilters {
+				m.transactionsFocus = (m.transactionsFocus + 1) % 4
+				return m, nil
+			}
 			if m.screen == screenAccounts && m.accountsPaneOpen {
 				if m.accountsPaneFocus == accountsFocusCards {
 					m.accountsPaneFocus = accountsFocusPane
@@ -690,6 +893,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "esc":
+			if m.screen == screenTransactionsFilters && m.transactionsCalendarOpen {
+				m.transactionsCalendarOpen = false
+				return m, nil
+			}
+			if m.screen == screenTransactionsFilters {
+				m.screen = screenTransactions
+				return m, nil
+			}
 			if m.screen == screenAccounts && m.accountsPaneOpen {
 				m.accountsPaneOpen = false
 				m.accountsPaneFocus = accountsFocusCards
@@ -698,6 +909,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
+				if m.transactionsPaneOpen {
+					m.transactionsPaneOpen = false
+					return m, nil
+				}
 				m.screen = screenHome
 				m.transactionsSession++
 				m.transactionsSyncing = false
@@ -719,8 +934,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenTransactions {
 				if m.transactionsCursor > 0 {
 					m.transactionsCursor--
+					m.ensureTransactionsScrollWindow()
+					return m, nil
 				}
-				m.ensureTransactionsScrollWindow()
+				if m.transactionsPage > 0 {
+					m.transactionsPage--
+					if m.transactionsPageSize > 0 {
+						m.transactionsCursor = m.transactionsPageSize - 1
+					} else {
+						m.transactionsCursor = 0
+					}
+					return m, m.loadTransactionsPreviewCmd()
+				}
 				return m, nil
 			}
 			if m.screen == screenAccounts {
@@ -751,8 +976,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenTransactions {
 				if m.transactionsCursor < len(m.transactionsRows)-1 {
 					m.transactionsCursor++
+					m.ensureTransactionsScrollWindow()
+					return m, nil
 				}
-				m.ensureTransactionsScrollWindow()
+				maxPage := 0
+				if m.transactionsPageSize > 0 && m.transactionsTotal > 0 {
+					maxPage = (m.transactionsTotal - 1) / m.transactionsPageSize
+				}
+				if m.transactionsPage < maxPage {
+					m.transactionsPage++
+					m.transactionsCursor = 0
+					return m, m.loadTransactionsPreviewCmd()
+				}
 				return m, nil
 			}
 			if m.screen == screenAccounts {
@@ -779,7 +1014,126 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenHome && m.selected < len(m.viewItems)-1 {
 				m.selected++
 			}
+		case "left":
+			if m.screen == screenTransactionsFilters &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if m.transactionsFocus == transactionsFocusQuickRange {
+					ranges := transactionsQuickRanges()
+					m.transactionsQuickIdx = (m.transactionsQuickIdx - 1 + len(ranges)) % len(ranges)
+					return m, nil
+				}
+				if m.transactionsFocus == transactionsFocusIncludeInternal {
+					m.transactionsIncludeInternal = false
+					return m, nil
+				}
+			}
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() &&
+				m.transactionsPage > 0 {
+				m.transactionsPage--
+				m.transactionsCursor = 0
+				return m, m.loadTransactionsPreviewCmd()
+			}
+		case "right":
+			if m.screen == screenTransactionsFilters &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if m.transactionsFocus == transactionsFocusQuickRange {
+					ranges := transactionsQuickRanges()
+					m.transactionsQuickIdx = (m.transactionsQuickIdx + 1) % len(ranges)
+					return m, nil
+				}
+				if m.transactionsFocus == transactionsFocusIncludeInternal {
+					m.transactionsIncludeInternal = true
+					return m, nil
+				}
+			}
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				maxPage := 0
+				if m.transactionsPageSize > 0 && m.transactionsTotal > 0 {
+					maxPage = (m.transactionsTotal - 1) / m.transactionsPageSize
+				}
+				if m.transactionsPage < maxPage {
+					m.transactionsPage++
+					m.transactionsCursor = 0
+					return m, m.loadTransactionsPreviewCmd()
+				}
+			}
+		case "f":
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				m.screen = screenTransactionsFilters
+				m.transactionsFocus = transactionsFocusFromDate
+				return m, nil
+			}
+		case "c":
+			if m.screen == screenTransactionsFilters &&
+				(m.transactionsFocus == transactionsFocusFromDate || m.transactionsFocus == transactionsFocusToDate) &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				m.transactionsCalendarTarget = m.transactionsFocus
+				selected := time.Now().In(time.Local)
+				digits := m.transactionsFromDate
+				if m.transactionsCalendarTarget == transactionsFocusToDate {
+					digits = m.transactionsToDate
+				}
+				if strings.TrimSpace(digits) != "" {
+					if t, ok := calendarAnchorFromPartial(digits); ok {
+						selected = t
+					}
+				}
+				m.transactionsCalendarCursor = time.Date(selected.Year(), selected.Month(), selected.Day(), 0, 0, 0, 0, time.Local)
+				m.transactionsCalendarMonth = time.Date(selected.Year(), selected.Month(), 1, 0, 0, 0, 0, time.Local)
+				m.transactionsCalendarOpen = true
+				return m, nil
+			}
+		case "s":
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				sorts := transactionsSortOptions()
+				m.transactionsSortIdx = (m.transactionsSortIdx + 1) % len(sorts)
+				m.transactionsPage = 0
+				return m, m.loadTransactionsPreviewCmd()
+			}
 		case "enter":
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if len(m.transactionsRows) == 0 {
+					return m, nil
+				}
+				m.transactionsPaneOpen = !m.transactionsPaneOpen
+				return m, nil
+			}
+			if m.screen == screenTransactionsFilters &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				switch m.transactionsFocus {
+				case transactionsFocusQuickRange:
+					m.applyTransactionsQuickRange(m.transactionsQuickIdx)
+					m.transactionsFilterMode = transactionsFilterModeQuick
+					m.transactionsPage = 0
+					m.transactionsDateErr = ""
+					return m, tea.Batch(m.saveTransactionsFiltersCmd(), m.loadTransactionsPreviewCmd())
+				case transactionsFocusFromDate, transactionsFocusToDate:
+					if err := validateTransactionsDateRange(m.transactionsFromDate, m.transactionsToDate); err != nil {
+						m.transactionsDateErr = err.Error()
+						return m, nil
+					}
+					m.transactionsFilterMode = transactionsFilterModeCustom
+					m.transactionsDateErr = ""
+					m.transactionsPage = 0
+					return m, tea.Batch(m.saveTransactionsFiltersCmd(), m.loadTransactionsPreviewCmd())
+				case transactionsFocusIncludeInternal:
+					return m, tea.Batch(m.saveTransactionsFiltersCmd(), m.loadTransactionsPreviewCmd())
+				}
+			}
 			if m.screen == screenAccounts &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
@@ -897,6 +1251,22 @@ func (m model) View() string {
 	}
 	if m.screen == screenTransactions {
 		content := contentStyle.Render(m.renderTransactionsScreen(layoutWidth))
+		if m.showHelpOverlay {
+			helpOverlay := renderHelpOverlay(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		if m.authDialog != authDialogNone {
+			authOverlay := m.renderAuthDialog(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		return frame.Render(content)
+	}
+	if m.screen == screenTransactionsFilters {
+		content := contentStyle.Render(m.renderTransactionsFiltersScreen(layoutWidth))
 		if m.showHelpOverlay {
 			helpOverlay := renderHelpOverlay(layoutWidth)
 			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
@@ -1143,11 +1513,27 @@ func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
 	m.selected = 2
 	m.screen = screenTransactions
 	m.transactionsErr = ""
+	m.transactionsDateErr = ""
+	m.transactionsFocus = transactionsFocusFromDate
+	m.transactionsPaneOpen = false
+	m.transactionsCursor = 0
+	m.transactionsOffset = 0
+	m.transactionsPage = 0
+	if m.transactionsPageSize <= 0 {
+		m.transactionsPageSize = 8
+	}
+	if m.transactionsFromDate == "" && m.transactionsToDate == "" {
+		m.transactionsQuickIdx = 2 // last 3 months
+		m.applyTransactionsQuickRange(m.transactionsQuickIdx)
+		m.transactionsFilterMode = transactionsFilterModeQuick
+	} else {
+		m.transactionsFilterMode = transactionsFilterModeCustom
+	}
 	m.transactionsSession++
 	m.transactionsSyncing = false
 	next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
 	return next, tea.Batch(
-		next.loadTransactionsPreviewCmd(),
+		next.loadTransactionsFiltersCmd(),
 		syncCmd,
 		next.transactionsReloadTickCmd(),
 		next.transactionsClockTickCmd(),
