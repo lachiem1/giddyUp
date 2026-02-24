@@ -26,6 +26,32 @@ func (c *Client) ListTransactions(ctx context.Context, opts TransactionListOptio
 	return &out, nil
 }
 
+// ListTransactionsPage calls GET /transactions with page[size]=50 and does not follow pagination.
+func (c *Client) ListTransactionsPage(ctx context.Context, opts TransactionListOptions) (*ListResponse, error) {
+	query := pageSizeQueryWithSize(transactionsPageSize)
+	applyTransactionFilters(query, opts)
+
+	var out ListResponse
+	if err := c.get(ctx, "/transactions", query, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListTransactionsPageByURL fetches a single paginated transactions page by links.next URL.
+func (c *Client) ListTransactionsPageByURL(ctx context.Context, next string) (*ListResponse, error) {
+	resolvedURL, err := resolveListURL(c.baseURL, next)
+	if err != nil {
+		return nil, err
+	}
+
+	var out ListResponse
+	if err := c.getURL(ctx, resolvedURL, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // GetTransaction calls GET /transactions/{id}.
 func (c *Client) GetTransaction(ctx context.Context, id string) (*ResourceResponse, error) {
 	var out ResourceResponse

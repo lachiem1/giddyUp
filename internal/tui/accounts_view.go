@@ -57,8 +57,15 @@ func (m model) renderAccountsScreen(layoutWidth int) string {
 		return strings.Join([]string{title, "", body}, "\n")
 	}
 
+	paneOpen := m.accountsPaneOpen
+	paneWidth := 36
+	gapWidth := 3
+
 	cardWidth := min(layoutWidth-20, 56)
-	cardWidth = max(32, cardWidth)
+	if paneOpen {
+		cardWidth = min(cardWidth, max(30, layoutWidth-paneWidth-gapWidth-4))
+	}
+	cardWidth = max(30, cardWidth)
 	visibleRows := m.accountsVisibleRows()
 	start := max(0, min(m.accountsOffset, max(0, len(m.accountsRows)-1)))
 	end := min(len(m.accountsRows), start+visibleRows)
@@ -76,21 +83,29 @@ func (m model) renderAccountsScreen(layoutWidth int) string {
 		row := m.accountsRows[i]
 
 		display := row.displayName
-		balance := "$" + strings.TrimSpace(row.balanceValue)
-		if strings.TrimSpace(row.balanceValue) == "" {
-			balance = "$0.00"
+		balance := formatMoneyDisplay(row.balanceValue)
+		goalSuffix := ""
+		if strings.TrimSpace(row.goalBalance) != "" {
+			goalSuffix = " / " + formatMoneyDisplay(row.goalBalance)
 		}
 
-		leftWidth := max(4, innerWidth-lipgloss.Width(balance)-1)
+		rightWhite := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true).Render(balance)
+		rightGrey := ""
+		if goalSuffix != "" {
+			rightGrey = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render(goalSuffix)
+		}
+		right := rightWhite + rightGrey
+
+		leftWidth := max(4, innerWidth-lipgloss.Width(right)-1)
 		left := lipgloss.NewStyle().
 			Width(leftWidth).
 			MaxWidth(leftWidth).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Bold(true).
 			Render(display)
 		content := lipgloss.NewStyle().
 			Width(innerWidth).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Bold(true).
-			Render(left + " " + balance)
+			Render(left + " " + right)
 		card := baseCard
 		if i == m.accountsCursor {
 			card = selectedCard
@@ -99,7 +114,6 @@ func (m model) renderAccountsScreen(layoutWidth int) string {
 	}
 
 	body := strings.Join(cards, "\n")
-	body = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, body)
 
 	shownFrom := 0
 	shownTo := 0
@@ -118,13 +132,11 @@ func (m model) renderAccountsScreen(layoutWidth int) string {
 	statusLine := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#9CA3AF")).
 		Render(fmt.Sprintf("showing %d-%d/%d   %s/%s to scroll", shownFrom, shownTo, len(m.accountsRows), upArrow, downArrow))
-	statusLine = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, statusLine)
 
 	totalLine := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#87CEEB")).
 		Bold(true).
 		Render("total " + formatTotalBalance(m.accountsRows))
-	totalLine = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, totalLine)
 
 	footer := ""
 	if m.accountsFetched != nil {
@@ -132,19 +144,108 @@ func (m model) renderAccountsScreen(layoutWidth int) string {
 		if age < 0 {
 			age = 0
 		}
-		staleTag := ""
-		if age > 30*time.Second {
-			staleTag = " (stale)"
-		}
 		footer = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#9CA3AF")).
-			Render(fmt.Sprintf("last updated %s ago%s", age.String(), staleTag))
-		footer = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, footer)
+			Render(fmt.Sprintf("last updated %s ago", age.String()))
 	}
-	if footer == "" {
-		return strings.Join([]string{title, "", body, "", statusLine, "", totalLine}, "\n")
+
+	hints := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#9CA3AF")).
+		Render("enter: open actions  tab: switch focus  esc: close/back")
+
+	leftParts := []string{body, "", statusLine, "", totalLine, "", hints}
+	if footer != "" {
+		leftParts = append(leftParts, "", footer)
 	}
-	return strings.Join([]string{title, "", body, "", statusLine, "", totalLine, "", footer}, "\n")
+	leftColumn := strings.Join(leftParts, "\n")
+
+	if !paneOpen {
+		leftColumn = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, leftColumn)
+		return strings.Join([]string{title, "", leftColumn}, "\n")
+	}
+
+	paneBorder := lipgloss.Color("#FFFFFF")
+	if m.accountsPaneFocus == accountsFocusPane {
+		paneBorder = lipgloss.Color("#FFD54A")
+	}
+	paneTitle := "account actions"
+	if len(m.accountsRows) > 0 && m.accountsCursor < len(m.accountsRows) {
+		paneTitle = m.accountsRows[m.accountsCursor].displayName
+	}
+	paneHeader := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#87CEEB")).
+		Bold(true).
+		Render(paneTitle)
+
+	actionItems := m.currentAccountActionItems()
+	actionRows := make([]string, 0, len(actionItems))
+	for i, item := range actionItems {
+		label := item
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
+		prefix := "  "
+		if i == m.accountsAction {
+			prefix = "› "
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD54A")).Bold(true)
+		}
+		actionRows = append(actionRows, style.Render(prefix+label))
+	}
+
+	paneBody := ""
+	if m.accountsGoalEditing {
+		input := m.accountsGoalInput
+		input.Width = max(12, paneWidth-10)
+		inputView := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Render(input.View())
+		hint := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")).
+			Render("digits + '.' (2dp max)  enter save  esc cancel")
+		errLine := ""
+		if strings.TrimSpace(m.accountsGoalErr) != "" {
+			errLine = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#F15B5B")).
+				Render(m.accountsGoalErr)
+		}
+		parts := []string{paneHeader, "", inputView, "", hint}
+		if errLine != "" {
+			parts = append(parts, "", errLine)
+		}
+		paneBody = strings.Join(parts, "\n")
+	} else {
+		paneHints := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")).
+			Render("↑/↓ pick  enter run  tab cards  esc close")
+		infoRows := []string{}
+		if len(m.accountsRows) > 0 && m.accountsCursor >= 0 && m.accountsCursor < len(m.accountsRows) {
+			row := m.accountsRows[m.accountsCursor]
+			label := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+			value := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
+			infoRows = append(infoRows, label.Render("type")+": "+value.Render(row.accountType))
+			infoRows = append(infoRows, label.Render("ownership")+": "+value.Render(row.ownershipType))
+			infoRows = append(infoRows, label.Render("currency")+": "+value.Render(row.balanceCurrency))
+			infoRows = append(infoRows, label.Render("created")+": "+value.Render(formatAccountCreatedAt(row.createdAt)))
+			infoRows = append(infoRows, label.Render("active")+": "+value.Render(formatBoolYesNo(row.isActive)))
+		}
+
+		paneBody = strings.Join([]string{
+			paneHeader,
+			"",
+			strings.Join(actionRows, "\n"),
+			"",
+			strings.Join(infoRows, "\n"),
+			"",
+			paneHints,
+		}, "\n")
+	}
+
+	pane := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(paneBorder).
+		Padding(1, 1).
+		Width(paneWidth).
+		Render(paneBody)
+
+	row := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, strings.Repeat(" ", gapWidth), pane)
+	row = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, row)
+	return strings.Join([]string{title, "", row}, "\n")
 }
 
 func (m model) loadAccountsPreviewCmd() tea.Cmd {
@@ -180,7 +281,17 @@ func (m model) syncAndReloadAccountsPreviewCmd(force bool) tea.Cmd {
 func queryAccountsPreview(db *sql.DB) ([]accountPreviewRow, *time.Time, error) {
 	rows, err := db.QueryContext(
 		context.Background(),
-		`SELECT id, display_name, balance_value, last_fetched_at
+		`SELECT
+			id,
+			display_name,
+			account_type,
+			ownership_type,
+			balance_currency_code,
+			created_at,
+			is_active,
+			balance_value,
+			goal_balance,
+			last_fetched_at
 		 FROM accounts
 		 WHERE is_active = 1
 		 ORDER BY display_order ASC, display_name ASC, id ASC`,
@@ -194,9 +305,26 @@ func queryAccountsPreview(db *sql.DB) ([]accountPreviewRow, *time.Time, error) {
 	var newest *time.Time
 	for rows.Next() {
 		var row accountPreviewRow
+		var isActive int
+		var goalBalance sql.NullString
 		var fetchedAtRaw string
-		if err := rows.Scan(&row.id, &row.displayName, &row.balanceValue, &fetchedAtRaw); err != nil {
+		if err := rows.Scan(
+			&row.id,
+			&row.displayName,
+			&row.accountType,
+			&row.ownershipType,
+			&row.balanceCurrency,
+			&row.createdAt,
+			&isActive,
+			&row.balanceValue,
+			&goalBalance,
+			&fetchedAtRaw,
+		); err != nil {
 			return nil, nil, err
+		}
+		row.isActive = isActive == 1
+		if goalBalance.Valid {
+			row.goalBalance = goalBalance.String
 		}
 		if t, err := time.Parse(time.RFC3339Nano, fetchedAtRaw); err == nil {
 			tt := t.UTC()
@@ -395,7 +523,7 @@ func segmentRuns(line string) [][2]int {
 
 func formatTotalBalance(rows []accountPreviewRow) string {
 	if len(rows) == 0 {
-		return "$0.00"
+		return "$0"
 	}
 	total := 0.0
 	for _, row := range rows {
@@ -412,7 +540,64 @@ func formatTotalBalance(rows []accountPreviewRow) string {
 	if math.Abs(total) < 0.0000001 {
 		total = 0
 	}
-	return fmt.Sprintf("$%.2f", total)
+	return "$" + formatMoneyDisplay(fmt.Sprintf("%.2f", total))
+}
+
+func formatMoneyDisplay(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "0"
+	}
+
+	sign := ""
+	if strings.HasPrefix(v, "-") {
+		sign = "-"
+		v = strings.TrimPrefix(v, "-")
+	}
+
+	parts := strings.SplitN(v, ".", 2)
+	whole := parts[0]
+	if whole == "" {
+		whole = "0"
+	}
+	if len(parts) == 1 {
+		return sign + whole
+	}
+
+	frac := parts[1]
+	if frac == "" {
+		return sign + whole
+	}
+	allZero := true
+	for _, ch := range frac {
+		if ch != '0' {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return sign + whole
+	}
+	return sign + whole + "." + frac
+}
+
+func formatAccountCreatedAt(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return v
+	}
+	return t.Local().Format("2006-01-02 15:04")
+}
+
+func formatBoolYesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
 }
 
 func moveAccountDisplayOrder(ctx context.Context, db *sql.DB, accountID string, delta int) error {
@@ -500,6 +685,26 @@ func moveAccountDisplayOrder(ctx context.Context, db *sql.DB, accountID string, 
 
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func saveAccountGoalBalance(ctx context.Context, db *sql.DB, accountID, goalBalance string) error {
+	res, err := db.ExecContext(
+		ctx,
+		"UPDATE accounts SET goal_balance = ? WHERE id = ?",
+		goalBalance,
+		accountID,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return errors.New("account not found")
 	}
 	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/lachiem1/giddyUp/internal/storage"
@@ -58,113 +57,35 @@ func (s *AccountsSyncer) LastSuccessAt(ctx context.Context) (time.Time, bool, er
 }
 
 func (s *AccountsSyncer) Sync(ctx context.Context) error {
-	attemptAt := time.Now().UTC()
-	if err := s.syncState.RecordAttempt(ctx, s.Collection(), attemptAt); err != nil {
-		return err
-	}
-
-	list, err := s.client.ListAccounts(ctx)
-	if err != nil {
-		_ = s.syncState.RecordError(context.Background(), s.Collection(), time.Now().UTC(), err)
-		return err
-	}
-
-	ids := make([]string, 0, len(list.Data))
-	for _, res := range list.Data {
-		if res.ID == "" {
-			continue
+	return runSyncAttempt(ctx, s.syncState, s.Collection(), func(runCtx context.Context) (time.Time, error) {
+		list, err := s.client.ListAccounts(runCtx)
+		if err != nil {
+			return time.Time{}, err
 		}
-		ids = append(ids, res.ID)
-	}
 
-	accounts, err := s.fetchAllAccounts(ctx, ids)
-	if err != nil {
-		_ = s.syncState.RecordError(context.Background(), s.Collection(), time.Now().UTC(), err)
-		return err
-	}
+		ids := make([]string, 0, len(list.Data))
+		for _, res := range list.Data {
+			if res.ID == "" {
+				continue
+			}
+			ids = append(ids, res.ID)
+		}
 
-	fetchedAt := time.Now().UTC()
-	if err := s.accounts.ReplaceSnapshot(ctx, accounts, fetchedAt); err != nil {
-		_ = s.syncState.RecordError(context.Background(), s.Collection(), time.Now().UTC(), err)
-		return err
-	}
-	if err := s.syncState.RecordSuccess(ctx, s.Collection(), fetchedAt); err != nil {
-		return err
-	}
-	return nil
+		accounts, err := s.fetchAllAccounts(runCtx, ids)
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		fetchedAt := time.Now().UTC()
+		if err := s.accounts.ReplaceSnapshot(runCtx, accounts, fetchedAt); err != nil {
+			return time.Time{}, err
+		}
+		return fetchedAt, nil
+	})
 }
 
 func (s *AccountsSyncer) fetchAllAccounts(ctx context.Context, ids []string) ([]storage.Account, error) {
-	if len(ids) == 0 {
-		return []storage.Account{}, nil
-	}
-
-	workers := s.workers
-	if workers > len(ids) {
-		workers = len(ids)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobs := make(chan string)
-	results := make(chan storage.Account, len(ids))
-
-	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
-
-	worker := func() {
-		defer wg.Done()
-		for id := range jobs {
-			if ctx.Err() != nil {
-				return
-			}
-			acct, err := s.fetchAccountByID(ctx, id)
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-					cancel()
-				}
-				errMu.Unlock()
-				return
-			}
-			results <- acct
-		}
-	}
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go worker()
-	}
-
-	go func() {
-		defer close(jobs)
-		for _, id := range ids {
-			select {
-			case <-ctx.Done():
-				return
-			case jobs <- id:
-			}
-		}
-	}()
-
-	wg.Wait()
-	close(results)
-
-	errMu.Lock()
-	err := firstErr
-	errMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-
-	accounts := make([]storage.Account, 0, len(ids))
-	for acct := range results {
-		accounts = append(accounts, acct)
-	}
-	return accounts, nil
+	return fetchAllByID(ctx, ids, s.workers, s.fetchAccountByID)
 }
 
 func (s *AccountsSyncer) fetchAccountByID(ctx context.Context, id string) (storage.Account, error) {
