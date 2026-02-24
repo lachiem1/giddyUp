@@ -20,7 +20,7 @@ const (
 	ModeSecure Mode = "secure"
 )
 
-const schemaVersion = 3
+const schemaVersion = 6
 
 type Config struct {
 	Mode Mode
@@ -151,6 +151,24 @@ INSERT OR IGNORE INTO schema_migrations (id, version) VALUES (1, 1);
 		}
 		currentVersion = 3
 	}
+	if currentVersion < 4 {
+		if err := applyV4Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 4
+	}
+	if currentVersion < 5 {
+		if err := applyV5Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 5
+	}
+	if currentVersion < 6 {
+		if err := applyV6Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 6
+	}
 
 	if currentVersion > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported version %d", currentVersion, schemaVersion)
@@ -176,6 +194,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   balance_currency_code TEXT NOT NULL,
   balance_value TEXT NOT NULL,
   balance_value_in_base_units INTEGER NOT NULL,
+  goal_balance TEXT,
   created_at TEXT NOT NULL,
   last_fetched_at TEXT NOT NULL,
   is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
@@ -259,6 +278,208 @@ func applyV3Migrations(ctx context.Context, db *sql.DB) error {
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit sqlite v3 migrations: %w", err)
+	}
+	return nil
+}
+
+func applyV4Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v4 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	hasGoalBalance, err := tableHasColumn(ctx, tx, "accounts", "goal_balance")
+	if err != nil {
+		return err
+	}
+	if !hasGoalBalance {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE accounts ADD COLUMN goal_balance TEXT"); err != nil {
+			return fmt.Errorf("add accounts.goal_balance column: %w", err)
+		}
+	}
+
+	// Up's spending account is TRANSACTIONAL; keep goal values for savers only.
+	if _, err = tx.ExecContext(ctx, `
+CREATE TRIGGER IF NOT EXISTS trg_accounts_goal_balance_insert
+AFTER INSERT ON accounts
+WHEN NEW.account_type = 'TRANSACTIONAL'
+BEGIN
+  UPDATE accounts
+  SET goal_balance = NULL
+  WHERE id = NEW.id;
+END;
+`); err != nil {
+		return fmt.Errorf("create accounts goal_balance insert trigger: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `
+CREATE TRIGGER IF NOT EXISTS trg_accounts_goal_balance_update
+AFTER UPDATE OF account_type, goal_balance ON accounts
+WHEN NEW.account_type = 'TRANSACTIONAL' AND NEW.goal_balance IS NOT NULL
+BEGIN
+  UPDATE accounts
+  SET goal_balance = NULL
+  WHERE id = NEW.id;
+END;
+`); err != nil {
+		return fmt.Errorf("create accounts goal_balance update trigger: %w", err)
+	}
+	if _, err = tx.ExecContext(
+		ctx,
+		"UPDATE accounts SET goal_balance = NULL WHERE account_type = 'TRANSACTIONAL'",
+	); err != nil {
+		return fmt.Errorf("clear transactional accounts goal_balance: %w", err)
+	}
+
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 4 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 4: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v4 migrations: %w", err)
+	}
+	return nil
+}
+
+func applyV5Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v5 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS app_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`); err != nil {
+		return fmt.Errorf("create app_config table: %w", err)
+	}
+
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 5 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 5: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v5 migrations: %w", err)
+	}
+	return nil
+}
+
+func applyV6Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v6 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	type colDef struct {
+		name string
+		ddl  string
+	}
+	cols := []colDef{
+		{name: "resource_type", ddl: "TEXT NOT NULL DEFAULT 'transactions'"},
+		{name: "raw_text", ddl: "TEXT"},
+		{name: "is_categorizable", ddl: "INTEGER NOT NULL DEFAULT 0 CHECK (is_categorizable IN (0,1))"},
+		{name: "hold_amount_currency_code", ddl: "TEXT"},
+		{name: "hold_amount_value", ddl: "TEXT"},
+		{name: "hold_amount_value_in_base_units", ddl: "INTEGER"},
+		{name: "hold_foreign_amount_currency_code", ddl: "TEXT"},
+		{name: "hold_foreign_amount_value", ddl: "TEXT"},
+		{name: "hold_foreign_amount_value_in_base_units", ddl: "INTEGER"},
+		{name: "round_up_amount_currency_code", ddl: "TEXT"},
+		{name: "round_up_amount_value", ddl: "TEXT"},
+		{name: "round_up_amount_value_in_base_units", ddl: "INTEGER"},
+		{name: "round_up_boost_portion_currency_code", ddl: "TEXT"},
+		{name: "round_up_boost_portion_value", ddl: "TEXT"},
+		{name: "round_up_boost_portion_value_in_base_units", ddl: "INTEGER"},
+		{name: "cashback_description", ddl: "TEXT"},
+		{name: "cashback_amount_currency_code", ddl: "TEXT"},
+		{name: "cashback_amount_value", ddl: "TEXT"},
+		{name: "cashback_amount_value_in_base_units", ddl: "INTEGER"},
+		{name: "foreign_amount_currency_code", ddl: "TEXT"},
+		{name: "foreign_amount_value", ddl: "TEXT"},
+		{name: "foreign_amount_value_in_base_units", ddl: "INTEGER"},
+		{name: "card_purchase_method_method", ddl: "TEXT"},
+		{name: "card_purchase_method_card_number_suffix", ddl: "TEXT"},
+		{name: "transaction_type", ddl: "TEXT"},
+		{name: "note_text", ddl: "TEXT"},
+		{name: "performing_customer_display_name", ddl: "TEXT"},
+		{name: "deep_link_url", ddl: "TEXT"},
+		{name: "account_resource_type", ddl: "TEXT"},
+		{name: "account_link_related", ddl: "TEXT"},
+		{name: "transfer_account_resource_type", ddl: "TEXT"},
+		{name: "transfer_account_id", ddl: "TEXT"},
+		{name: "transfer_account_link_related", ddl: "TEXT"},
+		{name: "category_resource_type", ddl: "TEXT"},
+		{name: "category_id", ddl: "TEXT"},
+		{name: "category_link_self", ddl: "TEXT"},
+		{name: "category_link_related", ddl: "TEXT"},
+		{name: "parent_category_resource_type", ddl: "TEXT"},
+		{name: "parent_category_id", ddl: "TEXT"},
+		{name: "parent_category_link_related", ddl: "TEXT"},
+		{name: "tags_link_self", ddl: "TEXT"},
+		{name: "attachment_resource_type", ddl: "TEXT"},
+		{name: "attachment_id", ddl: "TEXT"},
+		{name: "attachment_link_related", ddl: "TEXT"},
+		{name: "resource_link_self", ddl: "TEXT"},
+	}
+
+	for _, c := range cols {
+		hasCol, colErr := tableHasColumn(ctx, tx, "transactions", c.name)
+		if colErr != nil {
+			return colErr
+		}
+		if hasCol {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE transactions ADD COLUMN %s %s", c.name, c.ddl)
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("add transactions.%s column: %w", c.name, err)
+		}
+	}
+
+	if _, err = tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS transaction_tags (
+  transaction_id TEXT NOT NULL,
+  tag_id TEXT NOT NULL,
+  tag_type TEXT NOT NULL DEFAULT 'tags',
+  relationship_link_self TEXT,
+  last_fetched_at TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  PRIMARY KEY (transaction_id, tag_id),
+  FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
+);
+`); err != nil {
+		return fmt.Errorf("create transaction_tags table: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_transaction_tags_transaction_id ON transaction_tags(transaction_id)"); err != nil {
+		return fmt.Errorf("create transaction_tags transaction_id index: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_transactions_category_id ON transactions(category_id)"); err != nil {
+		return fmt.Errorf("create transactions category_id index: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_transactions_settled_at ON transactions(settled_at)"); err != nil {
+		return fmt.Errorf("create transactions settled_at index: %w", err)
+	}
+
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 6 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 6: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v6 migrations: %w", err)
 	}
 	return nil
 }

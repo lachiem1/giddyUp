@@ -14,6 +14,7 @@ import (
 const defaultBaseURL = "https://api.up.com.au/api/v1"
 const defaultPageSize = 15
 const accountsPageSize = 50
+const transactionsPageSize = 50
 
 // Client is a minimal Up API client.
 type Client struct {

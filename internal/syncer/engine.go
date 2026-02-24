@@ -58,7 +58,7 @@ func New(cfg Config, syncers []Syncer, onEvent func(Event)) (*Engine, error) {
 		cfg.StaleTTL = 30 * time.Second
 	}
 	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = 60 * time.Second
+		cfg.PollInterval = 2 * time.Minute
 	}
 	if len(cfg.Backoff) == 0 {
 		cfg.Backoff = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 60 * time.Second}
