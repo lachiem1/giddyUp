@@ -48,8 +48,15 @@ func Open(ctx context.Context) (*sql.DB, Config, error) {
 		return nil, Config{}, fmt.Errorf("ensure secure db key: %w", err)
 	}
 	if created {
-		if err := resetLocalDBFiles(cfg.Path); err != nil {
-			return nil, Config{}, fmt.Errorf("reset db after key creation: %w", err)
+		existing, err := hasLocalDBFiles(cfg.Path)
+		if err != nil {
+			return nil, Config{}, fmt.Errorf("check existing db files: %w", err)
+		}
+		if existing {
+			return nil, Config{}, errors.New(
+				"database key was missing; refusing to reset existing local db files. " +
+					"restore the original db key from keychain, or run /wipe to intentionally reset local data",
+			)
 		}
 	}
 
@@ -677,4 +684,26 @@ func resetLocalDBFiles(path string) error {
 		}
 	}
 	return nil
+}
+
+func hasLocalDBFiles(path string) (bool, error) {
+	paths := []string{
+		path,
+		path + "-wal",
+		path + "-shm",
+	}
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err == nil {
+			if !info.IsDir() {
+				return true, nil
+			}
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		return false, err
+	}
+	return false, nil
 }
