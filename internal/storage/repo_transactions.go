@@ -137,6 +137,11 @@ func (r *TransactionsRepo) UpsertBatch(ctx context.Context, records []Transactio
 	}()
 
 	fetchedValue := fetchedAt.UTC().Format(time.RFC3339Nano)
+	accountNames, err := loadAccountDisplayNameByID(ctx, tx)
+	if err != nil {
+		return err
+	}
+
 	const upsert = `
 INSERT INTO transactions (
   id, account_id, status, description, message,
@@ -155,7 +160,8 @@ INSERT INTO transactions (
   transfer_account_resource_type, transfer_account_id, transfer_account_link_related,
   category_resource_type, category_id, category_link_self, category_link_related,
   parent_category_resource_type, parent_category_id, parent_category_link_related,
-  tags_link_self, attachment_resource_type, attachment_id, attachment_link_related, resource_link_self
+  tags_link_self, attachment_resource_type, attachment_id, attachment_link_related, resource_link_self,
+  raw_text_norm, description_norm, merchant_norm
 ) VALUES (
   ?, ?, ?, ?, ?,
   ?, ?, ?,
@@ -173,7 +179,8 @@ INSERT INTO transactions (
   ?, ?, ?,
   ?, ?, ?, ?,
   ?, ?, ?,
-  ?, ?, ?, ?, ?
+  ?, ?, ?, ?, ?,
+  ?, ?, ?
 )
 ON CONFLICT(id) DO UPDATE SET
   account_id = excluded.account_id,
@@ -231,13 +238,33 @@ ON CONFLICT(id) DO UPDATE SET
   attachment_resource_type = excluded.attachment_resource_type,
   attachment_id = excluded.attachment_id,
   attachment_link_related = excluded.attachment_link_related,
-  resource_link_self = excluded.resource_link_self
+  resource_link_self = excluded.resource_link_self,
+  raw_text_norm = excluded.raw_text_norm,
+  description_norm = excluded.description_norm,
+  merchant_norm = excluded.merchant_norm
 `
 
 	for _, rcd := range records {
 		isCategorizable := 0
 		if rcd.IsCategorizable {
 			isCategorizable = 1
+		}
+		rawText := ptrStringValue(rcd.RawText)
+		rawTextNorm := normalizeTransactionText(rawText)
+		descriptionNorm := normalizeTransactionText(rcd.Description)
+		merchantNorm := normalizeTransactionMerchant(rawText, rcd.Description)
+		if rcd.TransferAccountID != nil && strings.TrimSpace(*rcd.TransferAccountID) != "" {
+			accountName := accountNames[rcd.AccountID]
+			transferName := accountNames[*rcd.TransferAccountID]
+			if normalizedTransfer, ok := normalizeInternalTransferMerchant(
+				accountName,
+				transferName,
+				rcd.AmountValueInBaseUnits,
+				rawText,
+				rcd.Description,
+			); ok {
+				merchantNorm = normalizedTransfer
+			}
 		}
 
 		if _, err = tx.ExecContext(
@@ -260,6 +287,7 @@ ON CONFLICT(id) DO UPDATE SET
 			ptrString(rcd.CategoryResourceType), ptrString(rcd.CategoryID), ptrString(rcd.CategoryLinkSelf), ptrString(rcd.CategoryLinkRelated),
 			ptrString(rcd.ParentCategoryResourceType), ptrString(rcd.ParentCategoryID), ptrString(rcd.ParentCategoryLinkRelated),
 			ptrString(rcd.TagsLinkSelf), ptrString(rcd.AttachmentResourceType), ptrString(rcd.AttachmentID), ptrString(rcd.AttachmentLinkRelated), ptrString(rcd.ResourceLinkSelf),
+			rawTextNorm, descriptionNorm, merchantNorm,
 		); err != nil {
 			return fmt.Errorf("upsert transaction %q: %w", rcd.ID, err)
 		}
@@ -310,6 +338,35 @@ func ptrInt64(v *int64) any {
 		return nil
 	}
 	return *v
+}
+
+func ptrStringValue(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func loadAccountDisplayNameByID(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(display_name, '') FROM accounts`)
+	if err != nil {
+		return nil, fmt.Errorf("query accounts for transaction merchant normalization: %w", err)
+	}
+	defer rows.Close()
+
+	names := make(map[string]string, 64)
+	for rows.Next() {
+		var id string
+		var displayName string
+		if err := rows.Scan(&id, &displayName); err != nil {
+			return nil, fmt.Errorf("scan accounts for transaction merchant normalization: %w", err)
+		}
+		names[id] = displayName
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate accounts for transaction merchant normalization: %w", err)
+	}
+	return names, nil
 }
 
 func emptyIfBlank(s string) string {

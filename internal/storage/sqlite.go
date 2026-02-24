@@ -20,7 +20,7 @@ const (
 	ModeSecure Mode = "secure"
 )
 
-const schemaVersion = 6
+const schemaVersion = 8
 
 type Config struct {
 	Mode Mode
@@ -168,6 +168,18 @@ INSERT OR IGNORE INTO schema_migrations (id, version) VALUES (1, 1);
 			return err
 		}
 		currentVersion = 6
+	}
+	if currentVersion < 7 {
+		if err := applyV7Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 7
+	}
+	if currentVersion < 8 {
+		if err := applyV8Migrations(ctx, db); err != nil {
+			return err
+		}
+		currentVersion = 8
 	}
 
 	if currentVersion > schemaVersion {
@@ -480,6 +492,148 @@ CREATE TABLE IF NOT EXISTS transaction_tags (
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit sqlite v6 migrations: %w", err)
+	}
+	return nil
+}
+
+func applyV7Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v7 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	type colDef struct {
+		name string
+		ddl  string
+	}
+	cols := []colDef{
+		{name: "raw_text_norm", ddl: "TEXT"},
+		{name: "description_norm", ddl: "TEXT"},
+		{name: "merchant_norm", ddl: "TEXT"},
+	}
+
+	for _, c := range cols {
+		hasCol, colErr := tableHasColumn(ctx, tx, "transactions", c.name)
+		if colErr != nil {
+			return colErr
+		}
+		if hasCol {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE transactions ADD COLUMN %s %s", c.name, c.ddl)
+		if _, err = tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("add transactions.%s column: %w", c.name, err)
+		}
+	}
+
+	if err := backfillTransactionsNormalizedText(ctx, tx); err != nil {
+		return err
+	}
+
+	if _, err = tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_transactions_merchant_norm ON transactions(merchant_norm)"); err != nil {
+		return fmt.Errorf("create transactions merchant_norm index: %w", err)
+	}
+
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 7 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 7: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v7 migrations: %w", err)
+	}
+	return nil
+}
+
+func applyV8Migrations(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite migration v8 transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if err := backfillTransactionsNormalizedText(ctx, tx); err != nil {
+		return err
+	}
+
+	if _, err = tx.ExecContext(ctx, "UPDATE schema_migrations SET version = 8 WHERE id = 1"); err != nil {
+		return fmt.Errorf("update sqlite schema version to 8: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite v8 migrations: %w", err)
+	}
+	return nil
+}
+
+func backfillTransactionsNormalizedText(ctx context.Context, tx *sql.Tx) error {
+	type txRow struct {
+		id             string
+		rawText        string
+		description    string
+		accountID      string
+		transferID     sql.NullString
+		amountBaseUnit int64
+	}
+	rows, err := tx.QueryContext(
+		ctx,
+		`SELECT id, COALESCE(raw_text, ''), COALESCE(description, ''), account_id, transfer_account_id, amount_value_in_base_units
+		 FROM transactions`,
+	)
+	if err != nil {
+		return fmt.Errorf("query transactions for normalized backfill: %w", err)
+	}
+	defer rows.Close()
+
+	updates := make([]txRow, 0, 256)
+	for rows.Next() {
+		var r txRow
+		if scanErr := rows.Scan(&r.id, &r.rawText, &r.description, &r.accountID, &r.transferID, &r.amountBaseUnit); scanErr != nil {
+			return fmt.Errorf("scan transactions for normalized backfill: %w", scanErr)
+		}
+		updates = append(updates, r)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate transactions for normalized backfill: %w", err)
+	}
+
+	accountNames, err := loadAccountDisplayNameByID(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE transactions SET raw_text_norm = ?, description_norm = ?, merchant_norm = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare transactions normalized backfill update: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, r := range updates {
+		rawNorm := normalizeTransactionText(r.rawText)
+		descriptionNorm := normalizeTransactionText(r.description)
+		merchantNorm := normalizeTransactionMerchant(r.rawText, r.description)
+		if r.transferID.Valid && strings.TrimSpace(r.transferID.String) != "" {
+			accountName := accountNames[r.accountID]
+			transferName := accountNames[r.transferID.String]
+			if normalizedTransfer, ok := normalizeInternalTransferMerchant(
+				accountName,
+				transferName,
+				r.amountBaseUnit,
+				r.rawText,
+				r.description,
+			); ok {
+				merchantNorm = normalizedTransfer
+			}
+		}
+		if _, err = stmt.ExecContext(ctx, rawNorm, descriptionNorm, merchantNorm, r.id); err != nil {
+			return fmt.Errorf("backfill normalized transaction text for %q: %w", r.id, err)
+		}
 	}
 	return nil
 }
