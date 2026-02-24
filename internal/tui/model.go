@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,9 +45,15 @@ type wipeDBMsg struct {
 }
 
 type accountPreviewRow struct {
-	id           string
-	displayName  string
-	balanceValue string
+	id              string
+	displayName     string
+	accountType     string
+	ownershipType   string
+	balanceCurrency string
+	createdAt       string
+	isActive        bool
+	balanceValue    string
+	goalBalance     string
 }
 
 type loadAccountsPreviewMsg struct {
@@ -65,12 +72,62 @@ type moveAccountMsg struct {
 	err error
 }
 
+type saveAccountGoalMsg struct {
+	err error
+}
+
 type accountsClockTickMsg struct {
 	sessionID int
 }
 
 type accountsAutoRefreshTickMsg struct {
 	sessionID int
+}
+
+type loadConfigMsg struct {
+	nextPayDate string
+	frequency   string
+	err         error
+}
+
+type saveConfigMsg struct {
+	err    error
+	silent bool
+}
+
+type transactionPreviewRow struct {
+	id          string
+	rawText     string
+	description string
+	amountValue string
+}
+
+type loadTransactionsPreviewMsg struct {
+	rows          []transactionPreviewRow
+	lastFetchedAt *time.Time
+	err           error
+}
+
+type syncTransactionsDoneMsg struct {
+	sessionID int
+	err       error
+}
+
+type transactionsReloadTickMsg struct {
+	sessionID int
+}
+
+type transactionsClockTickMsg struct {
+	sessionID int
+}
+
+type transactionsAutoRefreshTickMsg struct {
+	sessionID int
+}
+
+type transactionsPrewarmCheckMsg struct {
+	empty bool
+	err   error
 }
 
 type clearCommandTextMsg struct {
@@ -99,6 +156,13 @@ type screenMode int
 const (
 	screenHome screenMode = iota
 	screenAccounts
+	screenConfig
+	screenTransactions
+)
+
+const (
+	accountsFocusCards = iota
+	accountsFocusPane
 )
 
 type model struct {
@@ -122,18 +186,38 @@ type model struct {
 	commandSuggestionIndex  int
 	commandSuggestionOffset int
 
-	showHelpOverlay bool
-	authDialog      authDialogMode
-	screen          screenMode
-	connectHint     string
-	accountsRows    []accountPreviewRow
-	accountsFetched *time.Time
-	accountsErr     string
-	accountsLoading bool
-	accountsCursor  int
-	accountsOffset  int
-	accountsSession int
-	quitting        bool
+	showHelpOverlay      bool
+	authDialog           authDialogMode
+	screen               screenMode
+	connectHint          string
+	accountsRows         []accountPreviewRow
+	accountsFetched      *time.Time
+	accountsErr          string
+	accountsLoading      bool
+	accountsCursor       int
+	accountsOffset       int
+	accountsSession      int
+	accountsPaneOpen     bool
+	accountsPaneFocus    int
+	accountsAction       int
+	accountsGoalEditing  bool
+	accountsGoalErr      string
+	accountsGoalInput    textinput.Model
+	configNextPayDigits  string
+	configFrequencyIndex int
+	configLastSavedDate  string
+	configDateDirty      bool
+	configFocus          int
+	configErr            string
+	transactionsRows     []transactionPreviewRow
+	transactionsCursor   int
+	transactionsOffset   int
+	transactionsErr      string
+	transactionsFetched  *time.Time
+	transactionsSyncing  bool
+	transactionsSession  int
+	transactionsLastSync *time.Time
+	quitting             bool
 }
 
 func New(db *sql.DB) tea.Model {
@@ -149,28 +233,40 @@ func New(db *sql.DB) tea.Model {
 	pat.EchoMode = textinput.EchoPassword
 	pat.EchoCharacter = '•'
 
+	goalInput := textinput.New()
+	goalInput.Prompt = "$ "
+	goalInput.Placeholder = "0.00"
+	goalInput.Width = 20
+
 	return model{
 		db: db,
 		viewItems: []string{
+			"config",
 			"accounts",
 			"transactions",
 			"spend categories",
 			"pay cycle burndown",
 		},
-		selected:     0,
-		clicked:      -1,
-		cmd:          cmd,
-		pat:          pat,
-		status:       stateChecking,
-		statusDetail: "not connected",
-		authDialog:   authDialogNone,
-		screen:       screenHome,
-		commandText:  "",
+		selected:             0,
+		clicked:              -1,
+		cmd:                  cmd,
+		pat:                  pat,
+		status:               stateChecking,
+		statusDetail:         "not connected",
+		authDialog:           authDialogNone,
+		screen:               screenHome,
+		commandText:          "",
+		accountsGoalInput:    goalInput,
+		configFrequencyIndex: 0,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(checkConnectionCmd, m.loadAccountsPreviewCmd())
+	return tea.Batch(
+		checkConnectionCmd,
+		m.loadAccountsPreviewCmd(),
+		m.transactionsPrewarmCheckCmd(),
+	)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -238,6 +334,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.accountsCursor >= len(m.accountsRows) {
 			m.accountsCursor = max(0, len(m.accountsRows)-1)
 		}
+		m.clampAccountsAction()
 		m.ensureAccountsScrollWindow()
 		return m, nil
 
@@ -255,6 +352,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.accountsCursor >= len(m.accountsRows) {
 			m.accountsCursor = max(0, len(m.accountsRows)-1)
 		}
+		m.clampAccountsAction()
 		m.ensureAccountsScrollWindow()
 		return m, nil
 
@@ -266,6 +364,87 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.loadAccountsPreviewCmd()
+
+	case saveAccountGoalMsg:
+		if msg.err != nil {
+			m.accountsGoalErr = msg.err.Error()
+			return m, nil
+		}
+		m.accountsGoalErr = ""
+		m.accountsGoalEditing = false
+		m.accountsGoalInput.Blur()
+		m.accountsGoalInput.SetValue("")
+		next, cmd := m.withCommandFeedback("goal balance saved")
+		return next, tea.Batch(cmd, m.loadAccountsPreviewCmd())
+
+	case loadConfigMsg:
+		if msg.err != nil {
+			m.configErr = msg.err.Error()
+			return m, nil
+		}
+		m.configErr = ""
+		m.configNextPayDigits = dateToDigits(msg.nextPayDate)
+		m.configFrequencyIndex = frequencyIndexFromValue(msg.frequency)
+		m.configLastSavedDate = msg.nextPayDate
+		m.configDateDirty = false
+		return m, nil
+
+	case saveConfigMsg:
+		if msg.err != nil {
+			m.configErr = msg.err.Error()
+			return m, nil
+		}
+		m.configErr = ""
+		return m, nil
+
+	case loadTransactionsPreviewMsg:
+		if msg.err != nil {
+			m.transactionsErr = msg.err.Error()
+			return m, nil
+		}
+		m.transactionsErr = ""
+		m.transactionsRows = msg.rows
+		m.transactionsFetched = msg.lastFetchedAt
+		if m.transactionsCursor >= len(m.transactionsRows) {
+			m.transactionsCursor = max(0, len(m.transactionsRows)-1)
+		}
+		m.ensureTransactionsScrollWindow()
+		return m, nil
+
+	case syncTransactionsDoneMsg:
+		if msg.sessionID != m.transactionsSession {
+			return m, nil
+		}
+		m.transactionsSyncing = false
+		now := time.Now().UTC()
+		m.transactionsLastSync = &now
+		return m, m.loadTransactionsPreviewCmd()
+
+	case transactionsReloadTickMsg:
+		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions || !m.transactionsSyncing {
+			return m, nil
+		}
+		return m, tea.Batch(m.loadTransactionsPreviewCmd(), m.transactionsReloadTickCmd())
+
+	case transactionsClockTickMsg:
+		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions {
+			return m, nil
+		}
+		return m, m.transactionsClockTickCmd()
+
+	case transactionsAutoRefreshTickMsg:
+		if msg.sessionID != m.transactionsSession || m.screen != screenTransactions {
+			return m, nil
+		}
+		next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
+		return next, tea.Batch(syncCmd, m.transactionsAutoRefreshTickCmd())
+
+	case transactionsPrewarmCheckMsg:
+		if msg.err != nil || !msg.empty {
+			return m, nil
+		}
+		next, cmd := m.maybeStartTransactionsSyncCmd(false)
+		return next, cmd
 
 	case accountsClockTickMsg:
 		if msg.sessionID != m.accountsSession || m.screen != screenAccounts {
@@ -308,15 +487,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case 0:
 				m.clicked = 0
 				m.clickedID++
-				m.selected = 0
-				next, cmd := m.withCommandFeedback("accounts view selected")
-				return next, tea.Batch(cmd, clearButtonFlashCmd(m.clickedID))
+				m.selected = 1
+				return m, clearButtonFlashCmd(m.clickedID)
 			case 1:
 				m.clicked = 1
 				m.clickedID++
-				m.selected = 1
-				next, cmd := m.withCommandFeedback("transactions view selected")
-				return next, tea.Batch(cmd, clearButtonFlashCmd(m.clickedID))
+				m.selected = 2
+				return m, clearButtonFlashCmd(m.clickedID)
 			}
 		}
 		return m, nil
@@ -357,28 +534,175 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pat, cmd = m.pat.Update(msg)
 			return m, cmd
 		}
+		if m.screen == screenConfig {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				m.quitting = true
+				return m, tea.Quit
+			case "esc":
+				m.screen = screenHome
+				m.configErr = ""
+				m.cmd.Focus()
+				return m, nil
+			case "tab", "up", "down", "j", "k":
+				if m.configFocus == 0 {
+					m.configFocus = 1
+				} else {
+					m.configFocus = 0
+				}
+				return m, nil
+			case "left", "h":
+				if m.configFocus == 1 {
+					opts := configFrequencyOptions()
+					m.configFrequencyIndex = (m.configFrequencyIndex - 1 + len(opts)) % len(opts)
+					return m, nil
+				}
+			case "right", "l":
+				if m.configFocus == 1 {
+					opts := configFrequencyOptions()
+					m.configFrequencyIndex = (m.configFrequencyIndex + 1) % len(opts)
+					return m, nil
+				}
+			case "enter":
+				date, err := validateAndFormatDateDigits(m.configNextPayDigits, m.configDateDirty)
+				if err != nil {
+					m.configErr = err.Error()
+					return m, nil
+				}
+				freq := configFrequencyOptions()[m.configFrequencyIndex]
+				m.configErr = ""
+				return m, m.saveConfigCmd(date, freq)
+			case "backspace", "delete":
+				if m.configFocus == 0 {
+					if len(m.configNextPayDigits) > 0 {
+						m.configNextPayDigits = m.configNextPayDigits[:len(m.configNextPayDigits)-1]
+						m.configDateDirty = true
+					}
+					m.configErr = ""
+					return m, nil
+				}
+			}
+
+			var cmd tea.Cmd
+			if m.configFocus == 0 {
+				if msg.Type == tea.KeyRunes {
+					for _, ch := range msg.Runes {
+						if ch >= '0' && ch <= '9' && len(m.configNextPayDigits) < 8 {
+							m.configNextPayDigits += string(ch)
+							m.configDateDirty = true
+						}
+					}
+				}
+				if !m.configDateDirty {
+					return m, nil
+				}
+				formatted, err := validateAndFormatDateDigits(m.configNextPayDigits, true)
+				if err != nil {
+					// Show warnings only when full date is present.
+					if len(m.configNextPayDigits) == 8 {
+						m.configErr = err.Error()
+					} else {
+						m.configErr = ""
+					}
+					return m, nil
+				}
+				m.configErr = ""
+				if len(m.configNextPayDigits) == 8 && formatted != m.configLastSavedDate {
+					m.configLastSavedDate = formatted
+					return m, m.saveConfigDateCmd(formatted)
+				}
+			}
+			return m, cmd
+		}
+		if m.screen == screenAccounts && m.accountsGoalEditing {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				m.quitting = true
+				return m, tea.Quit
+			case "esc":
+				m.accountsGoalEditing = false
+				m.accountsGoalErr = ""
+				m.accountsGoalInput.SetValue("")
+				m.accountsGoalInput.Blur()
+				return m, nil
+			case "enter":
+				raw := strings.TrimSpace(m.accountsGoalInput.Value())
+				if raw == "" {
+					m.accountsGoalErr = "enter a number"
+					return m, nil
+				}
+				n, err := strconv.ParseFloat(raw, 64)
+				if err != nil || n < 0 {
+					m.accountsGoalErr = "invalid amount"
+					return m, nil
+				}
+				if len(m.accountsRows) == 0 || m.accountsCursor >= len(m.accountsRows) {
+					m.accountsGoalErr = "no account selected"
+					return m, nil
+				}
+				m.accountsGoalErr = ""
+				formatted := fmt.Sprintf("%.2f", n)
+				return m, m.saveAccountGoalCmd(m.accountsRows[m.accountsCursor].id, formatted)
+			}
+
+			var cmd tea.Cmd
+			m.accountsGoalInput, cmd = m.accountsGoalInput.Update(msg)
+			m.accountsGoalInput.SetValue(normalizeGoalInput(m.accountsGoalInput.Value()))
+			return m, cmd
+		}
 
 		switch msg.String() {
 		case "shift+up":
-			if m.screen == screenAccounts && len(m.accountsRows) > 0 && m.accountsCursor > 0 {
+			if m.screen == screenAccounts &&
+				(!m.accountsPaneOpen || m.accountsPaneFocus == accountsFocusCards) &&
+				len(m.accountsRows) > 0 &&
+				m.accountsCursor > 0 {
 				m.accountsCursor--
+				m.clampAccountsAction()
 				m.ensureAccountsScrollWindow()
 				id := m.accountsRows[m.accountsCursor+1].id
 				return m, m.moveAccountCmd(id, -1)
 			}
 			return m, nil
 		case "shift+down":
-			if m.screen == screenAccounts && len(m.accountsRows) > 0 && m.accountsCursor < len(m.accountsRows)-1 {
+			if m.screen == screenAccounts &&
+				(!m.accountsPaneOpen || m.accountsPaneFocus == accountsFocusCards) &&
+				len(m.accountsRows) > 0 &&
+				m.accountsCursor < len(m.accountsRows)-1 {
 				m.accountsCursor++
+				m.clampAccountsAction()
 				m.ensureAccountsScrollWindow()
 				id := m.accountsRows[m.accountsCursor-1].id
 				return m, m.moveAccountCmd(id, +1)
+			}
+			return m, nil
+		case "tab":
+			if m.screen == screenAccounts && m.accountsPaneOpen {
+				if m.accountsPaneFocus == accountsFocusCards {
+					m.accountsPaneFocus = accountsFocusPane
+				} else {
+					m.accountsPaneFocus = accountsFocusCards
+				}
+				return m, nil
 			}
 			return m, nil
 		case "ctrl+c", "q":
 			m.quitting = true
 			return m, tea.Quit
 		case "esc":
+			if m.screen == screenAccounts && m.accountsPaneOpen {
+				m.accountsPaneOpen = false
+				m.accountsPaneFocus = accountsFocusCards
+				return m, nil
+			}
+			if m.screen == screenTransactions &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				m.screen = screenHome
+				m.transactionsSession++
+				m.transactionsSyncing = false
+				return m, nil
+			}
 			if m.screen == screenAccounts &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
@@ -392,10 +716,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
+			if m.screen == screenTransactions {
+				if m.transactionsCursor > 0 {
+					m.transactionsCursor--
+				}
+				m.ensureTransactionsScrollWindow()
+				return m, nil
+			}
 			if m.screen == screenAccounts {
+				if m.accountsPaneOpen && m.accountsPaneFocus == accountsFocusPane {
+					if m.accountsAction > 0 {
+						m.accountsAction--
+					}
+					return m, nil
+				}
 				if m.accountsCursor > 0 {
 					m.accountsCursor--
 				}
+				m.clampAccountsAction()
 				m.ensureAccountsScrollWindow()
 				return m, nil
 			}
@@ -410,10 +748,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected--
 			}
 		case "down", "j":
+			if m.screen == screenTransactions {
+				if m.transactionsCursor < len(m.transactionsRows)-1 {
+					m.transactionsCursor++
+				}
+				m.ensureTransactionsScrollWindow()
+				return m, nil
+			}
 			if m.screen == screenAccounts {
+				if m.accountsPaneOpen && m.accountsPaneFocus == accountsFocusPane {
+					if m.accountsAction < len(m.currentAccountActionItems())-1 {
+						m.accountsAction++
+					}
+					return m, nil
+				}
 				if m.accountsCursor < len(m.accountsRows)-1 {
 					m.accountsCursor++
 				}
+				m.clampAccountsAction()
 				m.ensureAccountsScrollWindow()
 				return m, nil
 			}
@@ -428,11 +780,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected++
 			}
 		case "enter":
+			if m.screen == screenAccounts &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if len(m.accountsRows) == 0 {
+					return m, nil
+				}
+				if !m.accountsPaneOpen {
+					m.accountsPaneOpen = true
+					m.accountsPaneFocus = accountsFocusPane
+					m.accountsAction = 0
+					return m, nil
+				}
+				if m.accountsPaneFocus == accountsFocusCards {
+					m.accountsPaneFocus = accountsFocusPane
+					return m, nil
+				}
+				actions := m.currentAccountActionItems()
+				if len(actions) == 0 {
+					return m, nil
+				}
+				selectedAction := actions[m.accountsAction]
+				if selectedAction == "enter goal balance" {
+					m.accountsGoalEditing = true
+					m.accountsGoalErr = ""
+					m.accountsGoalInput.SetValue("")
+					m.accountsGoalInput.Focus()
+					return m, nil
+				}
+				return m.withCommandFeedback(fmt.Sprintf("%s: coming soon", selectedAction))
+			}
 			if m.screen == screenHome &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
-				!m.shouldShowCommandSuggestions() &&
-				m.selected == 0 {
-				return m.enterAccountsView()
+				!m.shouldShowCommandSuggestions() {
+				switch m.viewItems[m.selected] {
+				case "config":
+					return m.enterConfigView()
+				case "accounts":
+					return m.enterAccountsView()
+				case "transactions":
+					return m.enterTransactionsView()
+				default:
+					return m, nil
+				}
 			}
 			input := strings.TrimSpace(m.cmd.Value())
 			if m.shouldShowCommandSuggestions() {
@@ -490,6 +880,37 @@ func (m model) View() string {
 		}
 		return frame.Render(content)
 	}
+	if m.screen == screenConfig {
+		content := contentStyle.Render(m.renderConfigScreen(layoutWidth))
+		layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+		if m.showHelpOverlay {
+			helpOverlay := renderHelpOverlay(layoutWidth)
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		if m.authDialog != authDialogNone {
+			authOverlay := m.renderAuthDialog(layoutWidth)
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		return frame.Render(content)
+	}
+	if m.screen == screenTransactions {
+		content := contentStyle.Render(m.renderTransactionsScreen(layoutWidth))
+		if m.showHelpOverlay {
+			helpOverlay := renderHelpOverlay(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		if m.authDialog != authDialogNone {
+			authOverlay := m.renderAuthDialog(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		return frame.Render(content)
+	}
 
 	header := renderBlockTitle()
 	if m.width > 0 {
@@ -497,7 +918,7 @@ func (m model) View() string {
 	}
 	header = lipgloss.NewStyle().PaddingBottom(1).Render(header)
 
-	statusLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#5FA8FF")).Bold(true).Render("status: ")
+	statusLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("status: ")
 	statusValue := lipgloss.NewStyle().Foreground(lipgloss.Color("#F15B5B")).Bold(true).Render("not connected")
 	if m.status == stateConnected {
 		statusValue = lipgloss.NewStyle().Foreground(lipgloss.Color("#5CCB76")).Bold(true).Render("connected")
@@ -648,12 +1069,12 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.cmd.SetValue("")
 		m.clearCommandSuggestions()
 		return m, nil
+	case "/config":
+		return m.enterConfigView()
 	case "/accounts":
 		return m.enterAccountsView()
 	case "/transactions":
-		m.selected = 1
-		m.screen = screenHome
-		return m.withCommandFeedback("transactions view selected")
+		return m.enterTransactionsView()
 	case "/ping":
 		next, cmd := m.withCommandFeedback("checking connection...")
 		return next, tea.Batch(cmd, checkConnectionCmd)
@@ -667,8 +1088,6 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.cmd.Blur()
 		m.clearCommandSuggestions()
 		return m, nil
-	case "/settings":
-		return m.withCommandFeedback("settings has been removed from the views list.")
 	case "/connect":
 		hasPAT, err := auth.HasStoredPAT()
 		if err != nil {
@@ -700,16 +1119,39 @@ func (m model) withCommandFeedback(text string) (tea.Model, tea.Cmd) {
 }
 
 func (m model) enterAccountsView() (tea.Model, tea.Cmd) {
-	m.selected = 0
+	m.selected = 1
 	m.screen = screenAccounts
 	m.accountsErr = ""
 	m.accountsLoading = true
+	m.accountsPaneOpen = false
+	m.accountsPaneFocus = accountsFocusCards
+	m.accountsAction = 0
+	m.accountsGoalEditing = false
+	m.accountsGoalErr = ""
+	m.accountsGoalInput.SetValue("")
+	m.accountsGoalInput.Blur()
 	m.accountsSession++
 	return m, tea.Batch(
 		m.loadAccountsPreviewCmd(),
 		m.syncAndReloadAccountsPreviewCmd(false),
 		m.accountsClockTickCmd(),
 		m.accountsAutoRefreshTickCmd(),
+	)
+}
+
+func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
+	m.selected = 2
+	m.screen = screenTransactions
+	m.transactionsErr = ""
+	m.transactionsSession++
+	m.transactionsSyncing = false
+	next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
+	return next, tea.Batch(
+		next.loadTransactionsPreviewCmd(),
+		syncCmd,
+		next.transactionsReloadTickCmd(),
+		next.transactionsClockTickCmd(),
+		next.transactionsAutoRefreshTickCmd(),
 	)
 }
 
@@ -733,6 +1175,63 @@ func (m *model) ensureAccountsScrollWindow() {
 	}
 }
 
+func (m *model) ensureTransactionsScrollWindow() {
+	visible := m.transactionsVisibleRows()
+	if visible < 1 {
+		visible = 1
+	}
+	if m.transactionsCursor < m.transactionsOffset {
+		m.transactionsOffset = m.transactionsCursor
+	}
+	if m.transactionsCursor >= m.transactionsOffset+visible {
+		m.transactionsOffset = m.transactionsCursor - visible + 1
+	}
+	maxOffset := max(0, len(m.transactionsRows)-visible)
+	if m.transactionsOffset > maxOffset {
+		m.transactionsOffset = maxOffset
+	}
+	if m.transactionsOffset < 0 {
+		m.transactionsOffset = 0
+	}
+}
+
+func (m model) transactionsVisibleRows() int {
+	return 12
+}
+
+func (m model) maybeStartTransactionsSyncCmd(force bool) (model, tea.Cmd) {
+	if m.transactionsSyncing {
+		return m, nil
+	}
+	if !force && m.transactionsLastSync != nil && time.Since(m.transactionsLastSync.UTC()) < 15*time.Second {
+		return m, nil
+	}
+	m.transactionsSyncing = true
+	session := m.transactionsSession
+	return m, m.syncTransactionsCmd(session, force)
+}
+
+func (m model) transactionsReloadTickCmd() tea.Cmd {
+	session := m.transactionsSession
+	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg {
+		return transactionsReloadTickMsg{sessionID: session}
+	})
+}
+
+func (m model) transactionsClockTickCmd() tea.Cmd {
+	session := m.transactionsSession
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return transactionsClockTickMsg{sessionID: session}
+	})
+}
+
+func (m model) transactionsAutoRefreshTickCmd() tea.Cmd {
+	session := m.transactionsSession
+	return tea.Tick(2*time.Minute, func(time.Time) tea.Msg {
+		return transactionsAutoRefreshTickMsg{sessionID: session}
+	})
+}
+
 func (m model) accountsVisibleRows() int {
 	return 6
 }
@@ -746,7 +1245,7 @@ func (m model) accountsClockTickCmd() tea.Cmd {
 
 func (m model) accountsAutoRefreshTickCmd() tea.Cmd {
 	session := m.accountsSession
-	return tea.Tick(60*time.Second, func(time.Time) tea.Msg {
+	return tea.Tick(2*time.Minute, func(time.Time) tea.Msg {
 		return accountsAutoRefreshTickMsg{sessionID: session}
 	})
 }
@@ -761,6 +1260,74 @@ func (m model) moveAccountCmd(accountID string, delta int) tea.Cmd {
 		}
 		return moveAccountMsg{}
 	}
+}
+
+func (m model) accountsActionItems() []string {
+	return []string{
+		"enter goal balance",
+		"burndown chart",
+	}
+}
+
+func (m model) currentAccountActionItems() []string {
+	items := m.accountsActionItems()
+	if len(m.accountsRows) == 0 || m.accountsCursor < 0 || m.accountsCursor >= len(m.accountsRows) {
+		return items
+	}
+	if m.accountsRows[m.accountsCursor].accountType == "TRANSACTIONAL" {
+		return []string{"burndown chart"}
+	}
+	return items
+}
+
+func (m *model) clampAccountsAction() {
+	items := m.currentAccountActionItems()
+	if len(items) == 0 {
+		m.accountsAction = 0
+		return
+	}
+	if m.accountsAction < 0 {
+		m.accountsAction = 0
+		return
+	}
+	if m.accountsAction >= len(items) {
+		m.accountsAction = len(items) - 1
+	}
+}
+
+func (m model) saveAccountGoalCmd(accountID, goalBalance string) tea.Cmd {
+	return func() tea.Msg {
+		if m.db == nil {
+			return saveAccountGoalMsg{err: fmt.Errorf("database is not initialized")}
+		}
+		if err := saveAccountGoalBalance(context.Background(), m.db, accountID, goalBalance); err != nil {
+			return saveAccountGoalMsg{err: err}
+		}
+		return saveAccountGoalMsg{}
+	}
+}
+
+func normalizeGoalInput(raw string) string {
+	var b strings.Builder
+	hasDot := false
+	decimals := 0
+	for _, ch := range raw {
+		if ch >= '0' && ch <= '9' {
+			if hasDot {
+				if decimals >= 2 {
+					continue
+				}
+				decimals++
+			}
+			b.WriteRune(ch)
+			continue
+		}
+		if ch == '.' && !hasDot {
+			hasDot = true
+			b.WriteRune(ch)
+		}
+	}
+	return b.String()
 }
 
 func checkConnectionCmd() tea.Msg {
@@ -811,6 +1378,19 @@ func wipeDBCmd() tea.Msg {
 	return wipeDBMsg{path: cfg.Path}
 }
 
+func (m model) transactionsPrewarmCheckCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.db == nil {
+			return transactionsPrewarmCheckMsg{err: fmt.Errorf("database is not initialized")}
+		}
+		var count int
+		if err := m.db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM transactions").Scan(&count); err != nil {
+			return transactionsPrewarmCheckMsg{err: err}
+		}
+		return transactionsPrewarmCheckMsg{empty: count == 0}
+	}
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -831,12 +1411,21 @@ func canvasSafeWidth(width int) int {
 
 func renderViews(items []string, selected int, statusLine string) string {
 	lines := []string{statusLine, ""}
+	itemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true).Underline(true)
+	prefixStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F47A60")).Bold(true)
 	for i, item := range items {
 		prefix := "  "
+		style := itemStyle
 		if i == selected {
 			prefix = "> "
+			style = selectedStyle
 		}
-		lines = append(lines, prefix+item)
+		if i == selected {
+			lines = append(lines, prefixStyle.Render("> ")+style.Render(item))
+			continue
+		}
+		lines = append(lines, style.Render(prefix+item))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -894,13 +1483,13 @@ func pinIconOrFallback() string {
 func commandCatalog() []commandSpec {
 	return []commandSpec{
 		{name: "/help", description: "show command help overlay"},
+		{name: "/config", description: "open app config"},
 		{name: "/accounts", description: "select the accounts view"},
 		{name: "/transactions", description: "select the transactions view"},
 		{name: "/ping", description: "check Up API connectivity"},
 		{name: "/disconnect", description: "remove saved PAT from keychain"},
 		{name: "/db-wipe", description: "wipe and reinitialize the local database"},
 		{name: "/connect", description: "open the PAT connect prompt"},
-		{name: "/settings", description: "legacy command (removed view)"},
 	}
 }
 
