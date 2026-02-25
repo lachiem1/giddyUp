@@ -83,6 +83,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 	sortIdx := m.transactionsSortIdx
 	viewMode := m.transactionsViewMode
 	searchQuery := m.transactionsSearchApplied
+	timeSeriesCategory := strings.TrimSpace(m.transactionsTimeSeriesCategory)
 	return func() tea.Msg {
 		if m.db == nil {
 			return loadTransactionsPreviewMsg{err: fmt.Errorf("database is not initialized")}
@@ -101,12 +102,13 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 			}
 			orderBy = sorts[sortIdx].orderBy
 		}
-		rows, categorySpend, fetchedAt, total, clampedPage, err := queryTransactionsPreview(
+		rows, categorySpend, timeSeries, fetchedAt, total, clampedPage, err := queryTransactionsPreview(
 			m.db,
 			fromDigits,
 			toDigits,
 			includeInternal,
 			searchQuery,
+			timeSeriesCategory,
 			orderBy,
 			page,
 			pageSize,
@@ -117,6 +119,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 		return loadTransactionsPreviewMsg{
 			rows:          rows,
 			categorySpend: categorySpend,
+			timeSeries:    timeSeries,
 			lastFetchedAt: fetchedAt,
 			totalCount:    total,
 			page:          clampedPage,
@@ -436,23 +439,24 @@ func queryTransactionsPreview(
 	toDigits string,
 	includeInternal bool,
 	searchQuery string,
+	timeSeriesCategory string,
 	orderBy string,
 	page int,
 	pageSize int,
-) ([]transactionPreviewRow, []transactionsCategorySpend, *time.Time, int, int, error) {
+) ([]transactionPreviewRow, []transactionsCategorySpend, []transactionsTimeSeriesPoint, *time.Time, int, int, error) {
 	where := []string{"t.is_active = 1"}
 	args := make([]any, 0, 8)
 	if !includeInternal {
 		where = append(where, "t.transfer_account_id IS NULL")
 	}
 	if err := appendTransactionsSearchClauses(strings.TrimSpace(searchQuery), &where, &args); err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
 	}
 
 	if len(strings.TrimSpace(fromDigits)) == 8 {
 		fromDate, err := parseTransactionsDateDigits(fromDigits)
 		if err != nil {
-			return nil, nil, nil, 0, 0, err
+			return nil, nil, nil, nil, 0, 0, err
 		}
 		where = append(where, "date(t.created_at) >= date(?)")
 		args = append(args, fromDate)
@@ -460,7 +464,7 @@ func queryTransactionsPreview(
 	if len(strings.TrimSpace(toDigits)) == 8 {
 		toDate, err := parseTransactionsDateDigits(toDigits)
 		if err != nil {
-			return nil, nil, nil, 0, 0, err
+			return nil, nil, nil, nil, 0, 0, err
 		}
 		where = append(where, "date(t.created_at) <= date(?)")
 		args = append(args, toDate)
@@ -469,7 +473,7 @@ func queryTransactionsPreview(
 		fromDate, _ := parseTransactionsDateDigits(fromDigits)
 		toDate, _ := parseTransactionsDateDigits(toDigits)
 		if fromDate > toDate {
-			return nil, nil, nil, 0, 0, fmt.Errorf("from date cannot be after to date")
+			return nil, nil, nil, nil, 0, 0, fmt.Errorf("from date cannot be after to date")
 		}
 	}
 
@@ -480,7 +484,7 @@ func queryTransactionsPreview(
 		fmt.Sprintf("SELECT COUNT(*) FROM transactions t WHERE %s", whereSQL),
 		args...,
 	).Scan(&total); err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
 	}
 
 	if pageSize <= 0 {
@@ -530,7 +534,7 @@ func queryTransactionsPreview(
 	pageArgs := append(append([]any{}, args...), pageSize, offset)
 	rows, err := db.QueryContext(context.Background(), q, pageArgs...)
 	if err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
 	}
 	defer rows.Close()
 
@@ -551,31 +555,36 @@ func queryTransactionsPreview(
 			&r.noteText,
 			&r.accountName,
 		); err != nil {
-			return nil, nil, nil, 0, 0, err
+			return nil, nil, nil, nil, 0, 0, err
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
 	}
 
 	categorySpend, err := queryCategorySpend(context.Background(), db, whereSQL, args)
 	if err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
+	}
+
+	timeSeries, err := querySpendTimeSeries(context.Background(), db, whereSQL, args, fromDigits, toDigits, timeSeriesCategory)
+	if err != nil {
+		return nil, nil, nil, nil, 0, 0, err
 	}
 
 	var lastSuccess *time.Time
 	stateRepo := storage.NewSyncStateRepo(db)
 	state, found, err := stateRepo.Get(context.Background(), syncer.CollectionTransactions)
 	if err != nil {
-		return nil, nil, nil, 0, 0, err
+		return nil, nil, nil, nil, 0, 0, err
 	}
 	if found && state.LastSuccess != nil {
 		t := state.LastSuccess.UTC()
 		lastSuccess = &t
 	}
 
-	return out, categorySpend, lastSuccess, total, page, nil
+	return out, categorySpend, timeSeries, lastSuccess, total, page, nil
 }
 
 func queryCategoryTransactions(
@@ -638,8 +647,16 @@ func queryCategoryTransactions(
 				)
 			) AS merchant,
 			COALESCE(NULLIF(t.description_norm, ''), COALESCE(t.description, '')) AS description,
-			t.amount_value
+			t.amount_value,
+			COALESCE(NULLIF(t.raw_text_norm, ''), COALESCE(t.raw_text, '')) AS raw_text,
+			COALESCE(t.status, ''),
+			COALESCE(t.message, ''),
+			COALESCE(t.category_id, ''),
+			COALESCE(t.card_purchase_method_method, ''),
+			COALESCE(t.note_text, ''),
+			COALESCE(a.display_name, '')
 		 FROM transactions t
+		 LEFT JOIN accounts a ON a.id = t.account_id
 		 WHERE %s
 		 ORDER BY %s`,
 		whereSQL,
@@ -655,7 +672,20 @@ func queryCategoryTransactions(
 	out := make([]categoryTransactionRow, 0, 64)
 	for rows.Next() {
 		var r categoryTransactionRow
-		if err := rows.Scan(&r.id, &r.createdAt, &r.merchant, &r.description, &r.amountValue); err != nil {
+		if err := rows.Scan(
+			&r.id,
+			&r.createdAt,
+			&r.merchant,
+			&r.description,
+			&r.amountValue,
+			&r.rawText,
+			&r.status,
+			&r.message,
+			&r.categoryID,
+			&r.cardMethod,
+			&r.noteText,
+			&r.accountName,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -706,9 +736,99 @@ func queryCategorySpend(ctx context.Context, db *sql.DB, whereSQL string, args [
 	return out, nil
 }
 
+func querySpendTimeSeries(
+	ctx context.Context,
+	db *sql.DB,
+	whereSQL string,
+	args []any,
+	fromDigits string,
+	toDigits string,
+	timeSeriesCategory string,
+) ([]transactionsTimeSeriesPoint, error) {
+	_ = fromDigits
+	_ = toDigits
+
+	timeSeriesWhere := whereSQL
+	timeSeriesArgs := append([]any{}, args...)
+	timeSeriesWhere += " AND t.amount_value_in_base_units < 0"
+	if strings.TrimSpace(timeSeriesCategory) != "" {
+		timeSeriesWhere += " AND LOWER(COALESCE(NULLIF(TRIM(t.category_id), ''), 'uncategorized')) = ?"
+		timeSeriesArgs = append(timeSeriesArgs, strings.ToLower(strings.TrimSpace(timeSeriesCategory)))
+	}
+	q := fmt.Sprintf(
+		`SELECT
+			t.created_at,
+			date(t.created_at) AS day,
+			t.id,
+			COALESCE(
+				NULLIF(t.merchant_norm, ''),
+				COALESCE(
+					NULLIF(t.raw_text_norm, ''),
+					NULLIF(t.description_norm, ''),
+					COALESCE(t.raw_text, t.description, '')
+				)
+			) AS merchant,
+			COALESCE(NULLIF(t.raw_text_norm, ''), COALESCE(t.raw_text, '')) AS raw_text,
+			COALESCE(NULLIF(t.description_norm, ''), COALESCE(t.description, '')) AS description,
+			t.amount_value,
+			COALESCE(-t.amount_value_in_base_units, 0) AS spend_cents,
+			COALESCE(t.status, ''),
+			COALESCE(t.message, ''),
+			COALESCE(t.category_id, ''),
+			COALESCE(t.card_purchase_method_method, ''),
+			COALESCE(t.note_text, ''),
+			COALESCE(a.display_name, '')
+		 FROM transactions t
+		 LEFT JOIN accounts a ON a.id = t.account_id
+		 WHERE %s
+		 ORDER BY t.created_at ASC, t.id ASC`,
+		timeSeriesWhere,
+	)
+	rows, err := db.QueryContext(ctx, q, timeSeriesArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	raw := make([]transactionsTimeSeriesPoint, 0, 32)
+	for rows.Next() {
+		var p transactionsTimeSeriesPoint
+		var spend sql.NullInt64
+		if err := rows.Scan(
+			&p.createdAt,
+			&p.date,
+			&p.id,
+			&p.merchant,
+			&p.rawText,
+			&p.description,
+			&p.amountValue,
+			&spend,
+			&p.status,
+			&p.message,
+			&p.categoryID,
+			&p.cardMethod,
+			&p.noteText,
+			&p.accountName,
+		); err != nil {
+			return nil, err
+		}
+		if spend.Valid {
+			p.spendCents = spend.Int64
+		}
+		raw = append(raw, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func chartFooterHelpText(mode int) string {
 	if mode == transactionsViewModeTable {
 		return "/ search  f filters  s sort"
+	}
+	if mode == transactionsViewModeTimeSeries {
+		return "↑/↓ category  ←/→ node/pan  +/- zoom  enter details  f filters"
 	}
 	return "/ search  f filters"
 }
@@ -816,13 +936,30 @@ func renderTransactionsViewModeSelector(mode int) string {
 	return "view: " +
 		item("table [1]", mode == transactionsViewModeTable) +
 		"  | " +
-		item("chart [2]", mode == transactionsViewModeChart)
+		item("chart [2]", mode == transactionsViewModeChart) +
+		"  | " +
+		item("time series [3]", mode == transactionsViewModeTimeSeries)
 }
 
-func renderTransactionsBodyLines(mode int, rows []transactionPreviewRow, categorySpend []transactionsCategorySpend, cursor int, merchantW int, contentWidth int, chartCursor int, chartShowAmount bool) []string {
+func renderTransactionsBodyLines(
+	mode int,
+	rows []transactionPreviewRow,
+	categorySpend []transactionsCategorySpend,
+	timeSeries []transactionsTimeSeriesPoint,
+	timeSeriesCategory string,
+	timeSeriesColor lipgloss.Color,
+	timeSeriesSelected int,
+	cursor int,
+	merchantW int,
+	contentWidth int,
+	chartCursor int,
+	chartShowAmount bool,
+) []string {
 	switch mode {
 	case transactionsViewModeChart:
 		return renderTransactionsChartLines(categorySpend, contentWidth, chartCursor, chartShowAmount)
+	case transactionsViewModeTimeSeries:
+		return renderTransactionsTimeSeriesLines(timeSeries, contentWidth, timeSeriesCategory, timeSeriesColor, timeSeriesSelected)
 	default:
 		return renderTransactionsTableLines(rows, cursor, merchantW)
 	}
@@ -942,6 +1079,471 @@ func renderTransactionsChartLines(categorySpend []transactionsCategorySpend, con
 	return out
 }
 
+func renderTransactionsTimeSeriesLines(
+	points []transactionsTimeSeriesPoint,
+	contentWidth int,
+	categoryLabel string,
+	seriesColor lipgloss.Color,
+	selectedPoint int,
+) []string {
+	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+	if strings.TrimSpace(string(seriesColor)) == "" {
+		seriesColor = lipgloss.Color("#6CBFE6")
+	}
+	lineStyle := lipgloss.NewStyle().Foreground(seriesColor)
+	seriesLabelStyle := lipgloss.NewStyle().Foreground(seriesColor).Bold(true)
+
+	out := []string{titleStyle.Render("spend over time")}
+	seriesName := "all"
+	if strings.TrimSpace(categoryLabel) != "" {
+		seriesName = strings.TrimSpace(categoryLabel)
+	}
+	out = append(out, seriesLabelStyle.Render("category: "+seriesName))
+	if len(points) == 0 {
+		return append(out, labelStyle.Render("no transactions found"))
+	}
+	if selectedPoint < 0 || selectedPoint >= len(points) {
+		selectedPoint = len(points) - 1
+	}
+
+	maxSpend := int64(0)
+	totalSpend := int64(0)
+	for _, p := range points {
+		if p.spendCents > maxSpend {
+			maxSpend = p.spendCents
+		}
+		totalSpend += p.spendCents
+	}
+	if maxSpend <= 0 {
+		maxSpend = 1
+	}
+
+	innerWidth := max(12, contentWidth-2)
+	plotHeight := 8
+	if contentWidth >= 58 {
+		plotHeight = 9
+	}
+	if contentWidth >= 72 {
+		plotHeight = 10
+	}
+	yTickCount := min(5, max(3, plotHeight-1))
+	yTickByRow := make(map[int]int64, yTickCount)
+	for i := 0; i < yTickCount; i++ {
+		row := int(math.Round(float64(i) * float64((plotHeight-1)-1) / float64(yTickCount-1)))
+		ratio := float64((plotHeight-1)-row) / float64(plotHeight-1)
+		yTickByRow[row] = int64(math.Round(ratio * float64(maxSpend)))
+	}
+	yTickByRow[plotHeight-1] = 0
+	yLabelWidth := 1
+	for _, cents := range yTickByRow {
+		w := lipgloss.Width(formatTimeSeriesDollar(cents))
+		if w > yLabelWidth {
+			yLabelWidth = w
+		}
+	}
+
+	graphWidth := max(10, innerWidth-yLabelWidth-1)
+	dataCols := max(8, graphWidth-1) // keep first column for y-axis
+	graphWidth = dataCols + 1
+	xAxisRow := plotHeight - 1
+	grid := make([][]rune, plotHeight)
+	for i := range grid {
+		grid[i] = make([]rune, graphWidth)
+		for j := range grid[i] {
+			grid[i][j] = ' '
+		}
+		grid[i][0] = '|'
+	}
+	for x := 0; x < graphWidth; x++ {
+		grid[xAxisRow][x] = '—'
+	}
+	grid[xAxisRow][0] = '└'
+
+	pointX := make([]int, len(points))
+	pointY := make([]int, len(points))
+	for i := range points {
+		pointX[i] = timeSeriesPointColumn(i, len(points), dataCols)
+	}
+
+	prevGridX, prevGridY := -1, -1
+	for i, p := range points {
+		ratio := 0.0
+		if maxSpend > 0 {
+			ratio = float64(p.spendCents) / float64(maxSpend)
+		}
+		y := xAxisRow - int(math.Round(ratio*float64(xAxisRow)))
+		y = max(0, min(plotHeight-1, y))
+		if y == xAxisRow && xAxisRow > 0 {
+			// Keep x-axis visually continuous; show near-zero points just above axis.
+			y = xAxisRow - 1
+		}
+		gridX := pointX[i] + 1 // shift right of y-axis
+		pointY[i] = y
+		if prevGridX >= 0 {
+			drawTransactionsSeriesSegment(grid, prevGridX, prevGridY, gridX, y, xAxisRow)
+		}
+		prevGridX, prevGridY = gridX, y
+	}
+
+	for i := range points {
+		gridX := pointX[i] + 1
+		nodeChar := '●'
+		if i == selectedPoint {
+			nodeChar = '◉'
+		}
+		grid[pointY[i]][gridX] = nodeChar
+	}
+
+	for row := 0; row < plotHeight; row++ {
+		axisLabel := ""
+		if cents, ok := yTickByRow[row]; ok {
+			axisLabel = formatTimeSeriesDollar(cents)
+		}
+		prefix := fmt.Sprintf("%*s ", yLabelWidth, axisLabel)
+		graphPart := truncateDisplayWidth(string(grid[row]), max(1, innerWidth-lipgloss.Width(prefix)))
+		out = append(out, labelStyle.Render(prefix)+lineStyle.Render(graphPart))
+	}
+
+	axisPrefix := strings.Repeat(" ", yLabelWidth+1)
+
+	spanDays := timeSeriesDateSpanDays(points)
+	tickPositions := buildTimeSeriesTickPositions(dataCols, innerWidth, spanDays)
+	tickLabels := make([]string, 0, len(tickPositions))
+	tickRunes := make([]rune, graphWidth)
+	for i := range tickRunes {
+		tickRunes[i] = ' '
+	}
+	lastTickDay := ""
+	for _, pos := range tickPositions {
+		if pos < 0 || pos >= dataCols {
+			continue
+		}
+		tickRunes[pos+1] = '|'
+		tickTS, tickDate := timestampForTimeSeriesTick(points, pos, dataCols)
+		label := formatTimeSeriesTickLabel(tickDate, spanDays)
+		if !tickTS.IsZero() {
+			day := tickTS.Format("2006-01-02")
+			if day == lastTickDay && lastTickDay != "" {
+				label = tickTS.Format("15:04")
+			}
+			lastTickDay = day
+		}
+		tickLabels = append(tickLabels, label)
+	}
+	out = append(out, labelStyle.Render(truncateDisplayWidth(axisPrefix+string(tickRunes), innerWidth)))
+	shiftedTickPositions := make([]int, 0, len(tickPositions))
+	for _, pos := range tickPositions {
+		shiftedTickPositions = append(shiftedTickPositions, pos+1)
+	}
+	out = append(out, labelStyle.Render(truncateDisplayWidth(axisPrefix+renderTimeSeriesLabelRow(graphWidth, shiftedTickPositions, tickLabels), innerWidth)))
+	xAxisLabel := lipgloss.NewStyle().Width(graphWidth).Align(lipgloss.Center).Render("date")
+	out = append(out, labelStyle.Render(truncateDisplayWidth(axisPrefix+xAxisLabel, innerWidth)))
+	out = append(out, labelStyle.Render(truncateDisplayWidth(strings.Repeat(" ", yLabelWidth)+"$", innerWidth)))
+
+	out = append(out, labelStyle.Render(truncateDisplayWidth(fmt.Sprintf("total spend: %s", formatTimeSeriesDollar(totalSpend)), innerWidth)))
+	return out
+}
+
+func drawTransactionsSeriesSegment(grid [][]rune, x0 int, y0 int, x1 int, y1 int, xAxisRow int) {
+	if len(grid) == 0 || len(grid[0]) == 0 {
+		return
+	}
+	dx := x1 - x0
+	dy := y1 - y0
+	steps := max(absInt(dx), absInt(dy))
+	if steps <= 0 {
+		return
+	}
+	for step := 1; step < steps; step++ {
+		x := x0 + int(math.Round(float64(step*dx)/float64(steps)))
+		y := y0 + int(math.Round(float64(step*dy)/float64(steps)))
+		if y < 0 || y >= len(grid) || x < 0 || x >= len(grid[y]) {
+			continue
+		}
+		if x == 0 || y == xAxisRow {
+			continue
+		}
+		if grid[y][x] == ' ' || grid[y][x] == '—' {
+			grid[y][x] = '.'
+		}
+	}
+}
+
+func resampleTransactionsTimeSeries(points []transactionsTimeSeriesPoint, maxWidth int) []transactionsTimeSeriesPoint {
+	if len(points) == 0 {
+		return nil
+	}
+	if maxWidth <= 0 {
+		return nil
+	}
+	if maxWidth == 1 {
+		return []transactionsTimeSeriesPoint{points[len(points)-1]}
+	}
+	if len(points) == maxWidth {
+		out := make([]transactionsTimeSeriesPoint, len(points))
+		copy(out, points)
+		return out
+	}
+	if len(points) == 1 {
+		out := make([]transactionsTimeSeriesPoint, maxWidth)
+		for i := range out {
+			out[i] = points[0]
+		}
+		return out
+	}
+
+	// Downsample using bucket averages to preserve broad trend across wide ranges.
+	if len(points) > maxWidth {
+		out := make([]transactionsTimeSeriesPoint, 0, maxWidth)
+		bucket := float64(len(points)) / float64(maxWidth)
+		for i := 0; i < maxWidth; i++ {
+			start := int(math.Floor(float64(i) * bucket))
+			end := int(math.Floor(float64(i+1) * bucket))
+			if end <= start {
+				end = start + 1
+			}
+			start = max(0, min(start, len(points)-1))
+			end = max(start+1, min(end, len(points)))
+
+			var sum int64
+			for j := start; j < end; j++ {
+				sum += points[j].spendCents
+			}
+			avg := sum / int64(end-start)
+			out = append(out, transactionsTimeSeriesPoint{
+				date:       points[end-1].date,
+				spendCents: avg,
+			})
+		}
+		return out
+	}
+
+	// Upsample to fill the whole plot width so axis length remains stable while zooming.
+	out := make([]transactionsTimeSeriesPoint, 0, maxWidth)
+	srcLast := len(points) - 1
+	for i := 0; i < maxWidth; i++ {
+		pos := float64(i) * float64(srcLast) / float64(maxWidth-1)
+		lo := int(math.Floor(pos))
+		hi := int(math.Ceil(pos))
+		if hi > srcLast {
+			hi = srcLast
+		}
+		if lo < 0 {
+			lo = 0
+		}
+		if lo > srcLast {
+			lo = srcLast
+		}
+
+		frac := pos - float64(lo)
+		spend := points[lo].spendCents
+		if hi != lo {
+			delta := points[hi].spendCents - points[lo].spendCents
+			spend = int64(math.Round(float64(points[lo].spendCents) + float64(delta)*frac))
+		}
+		dateIdx := int(math.Round(pos))
+		if dateIdx < 0 {
+			dateIdx = 0
+		}
+		if dateIdx > srcLast {
+			dateIdx = srcLast
+		}
+		out = append(out, transactionsTimeSeriesPoint{
+			date:       points[dateIdx].date,
+			spendCents: spend,
+		})
+	}
+	return out
+}
+
+func formatTimeSeriesDollar(cents int64) string {
+	dollars := float64(cents) / 100.0
+	value := fmt.Sprintf("$%.2f", dollars)
+	if strings.HasSuffix(value, ".00") {
+		value = strings.TrimSuffix(value, ".00")
+	}
+	return value
+}
+
+func timeSeriesDateSpanDays(points []transactionsTimeSeriesPoint) int {
+	if len(points) < 2 {
+		if len(points) == 1 {
+			return 1
+		}
+		return 0
+	}
+	start, okStart := parseTimeSeriesDate(points[0].date)
+	end, okEnd := parseTimeSeriesDate(points[len(points)-1].date)
+	if !okStart || !okEnd || end.Before(start) {
+		return len(points)
+	}
+	return int(end.Sub(start).Hours()/24) + 1
+}
+
+func parseTimeSeriesDate(raw string) (time.Time, bool) {
+	t, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(raw), time.Local)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func formatTimeSeriesTickLabel(raw string, spanDays int) string {
+	t, ok := parseTimeSeriesDate(raw)
+	if !ok {
+		return truncateDisplayWidth(strings.TrimSpace(raw), 10)
+	}
+	switch {
+	case spanDays <= 31:
+		return t.Format("02 Jan")
+	case spanDays <= 92:
+		return t.Format("Jan 02")
+	case spanDays <= 1095:
+		return t.Format("Jan 2006")
+	default:
+		return t.Format("2006")
+	}
+}
+
+func timeSeriesPointColumn(pointIdx int, pointCount int, colCount int) int {
+	if pointCount <= 1 || colCount <= 1 {
+		return 0
+	}
+	if pointIdx < 0 {
+		pointIdx = 0
+	}
+	if pointIdx >= pointCount {
+		pointIdx = pointCount - 1
+	}
+	return int(math.Round(float64(pointIdx) * float64(colCount-1) / float64(pointCount-1)))
+}
+
+func timestampForTimeSeriesTick(points []transactionsTimeSeriesPoint, pos int, colCount int) (time.Time, string) {
+	if len(points) == 0 {
+		return time.Time{}, ""
+	}
+	if len(points) == 1 || colCount <= 1 {
+		last := points[len(points)-1]
+		if ts, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(last.createdAt)); err == nil {
+			return ts.In(time.Local), ts.In(time.Local).Format("2006-01-02")
+		}
+		return time.Time{}, last.date
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= colCount {
+		pos = colCount - 1
+	}
+	ratio := float64(pos) / float64(colCount-1)
+	idx := int(math.Round(ratio * float64(len(points)-1)))
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(points) {
+		idx = len(points) - 1
+	}
+	point := points[idx]
+	if ts, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(point.createdAt)); err == nil {
+		local := ts.In(time.Local)
+		return local, local.Format("2006-01-02")
+	}
+	if d, ok := parseTimeSeriesDate(point.date); ok {
+		return d, d.Format("2006-01-02")
+	}
+	return time.Time{}, point.date
+}
+
+func buildTimeSeriesTickPositions(pointCount int, contentWidth int, spanDays int) []int {
+	if pointCount <= 0 {
+		return nil
+	}
+	target := max(2, min(4, contentWidth/20))
+	switch {
+	case spanDays <= 14:
+		target = max(target, min(10, contentWidth/9))
+	case spanDays <= 31:
+		target = max(target, min(8, contentWidth/11))
+	case spanDays <= 92:
+		target = max(target, min(6, contentWidth/14))
+	}
+	target = min(target, pointCount)
+	if target == 1 {
+		return []int{0}
+	}
+	out := make([]int, 0, target)
+	last := -1
+	for i := 0; i < target; i++ {
+		pos := int(math.Round(float64(i) * float64(pointCount-1) / float64(target-1)))
+		if pos == last {
+			continue
+		}
+		out = append(out, pos)
+		last = pos
+	}
+	if len(out) == 0 {
+		return []int{0}
+	}
+	if out[0] != 0 {
+		out = append([]int{0}, out...)
+	}
+	if out[len(out)-1] != pointCount-1 {
+		out = append(out, pointCount-1)
+	}
+	return out
+}
+
+func renderTimeSeriesLabelRow(width int, tickPositions []int, labels []string) string {
+	if width <= 0 {
+		return ""
+	}
+	row := make([]rune, width)
+	for i := range row {
+		row[i] = ' '
+	}
+	lastEnd := -2
+	for i := 0; i < len(tickPositions) && i < len(labels); i++ {
+		label := strings.TrimSpace(labels[i])
+		if label == "" {
+			continue
+		}
+		pos := tickPositions[i]
+		if pos < 0 || pos >= width {
+			continue
+		}
+		runes := []rune(label)
+		if len(runes) > width {
+			runes = runes[:width]
+		}
+		start := pos - (len(runes) / 2)
+		if start < 0 {
+			start = 0
+		}
+		if start+len(runes) > width {
+			start = width - len(runes)
+		}
+		end := start + len(runes) - 1
+		if start <= lastEnd+1 {
+			continue
+		}
+		for j, r := range runes {
+			row[start+j] = r
+		}
+		if end > lastEnd {
+			lastEnd = end
+		}
+	}
+	return string(row)
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 func (m model) renderTransactionsScreen(layoutWidth int) string {
 	title := renderTransactionsTitle()
 	title = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, title)
@@ -954,6 +1556,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	rangeLabel := transactionsRangeLabel(m.transactionsFromDate, m.transactionsToDate)
 
 	tableBorder := lipgloss.Color("#FFFFFF")
+	chartPaneBorder := lipgloss.Color("#FFD54A")
 	mainCap := int(math.Round(float64(layoutWidth) * 0.78))
 	maxMainWidth := min(layoutWidth-8, max(36, mainCap))
 	if maxMainWidth < 20 {
@@ -962,8 +1565,20 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	paneWidth := max(30, min(40, layoutWidth/3))
 	gapWidth := 3
 	hasTablePane := m.transactionsViewMode == transactionsViewModeTable && m.transactionsPaneOpen
+	hasTimeSeriesPane := m.transactionsViewMode == transactionsViewModeTimeSeries &&
+		m.transactionsPaneOpen &&
+		len(m.transactionsTimeSeries) > 0
 	hasChartPane := m.transactionsViewMode == transactionsViewModeChart && m.transactionsChartPaneOpen
-	if hasTablePane || hasChartPane {
+	if hasChartPane {
+		if m.transactionsChartPaneFocus == transactionsChartFocusMain {
+			tableBorder = lipgloss.Color("#FFD54A")
+			chartPaneBorder = lipgloss.Color("#FFFFFF")
+		} else {
+			tableBorder = lipgloss.Color("#FFFFFF")
+			chartPaneBorder = lipgloss.Color("#FFD54A")
+		}
+	}
+	if hasTablePane || hasTimeSeriesPane || hasChartPane {
 		maxLeft := layoutWidth - paneWidth - gapWidth - 2
 		maxMainWidth = min(maxMainWidth, max(36, maxLeft))
 	}
@@ -1028,8 +1643,67 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		chartCursorInWindow = m.transactionsChartCursor - startIdx
 	}
 	chartShowAmount := !hasChartPane
-	tableLines := renderTransactionsBodyLines(m.transactionsViewMode, m.transactionsRows, chartSpendForCard, m.transactionsCursor, merchantW, tableContentWidth, chartCursorInWindow, chartShowAmount)
-	tableBodyHeight := m.transactionsChartVisibleRows() + 1
+	timeSeriesCategoryLabel := ""
+	timeSeriesColor := lipgloss.Color("#6CBFE6")
+	timeSeriesForCard := m.transactionsTimeSeries
+	timeSeriesSelectedLocal := -1
+	if m.transactionsViewMode == transactionsViewModeTimeSeries {
+		startIdx, endIdx := m.transactionsTimeSeriesBounds(len(m.transactionsTimeSeries))
+		if endIdx < startIdx {
+			endIdx = startIdx
+		}
+		timeSeriesForCard = m.transactionsTimeSeries[startIdx:endIdx]
+		if len(m.transactionsTimeSeries) > 0 && len(timeSeriesForCard) > 0 {
+			selectedAbs := m.transactionsTimeSeriesSelection
+			if selectedAbs < 0 || selectedAbs >= len(m.transactionsTimeSeries) {
+				selectedAbs = len(m.transactionsTimeSeries) - 1
+			}
+			if selectedAbs < startIdx {
+				selectedAbs = startIdx
+			}
+			if selectedAbs >= endIdx {
+				selectedAbs = endIdx - 1
+			}
+			timeSeriesSelectedLocal = selectedAbs - startIdx
+		}
+	}
+	if selectedCategory := strings.TrimSpace(m.transactionsTimeSeriesCategory); selectedCategory != "" {
+		timeSeriesCategoryLabel = selectedCategory
+		for i := range m.transactionsCategorySpend {
+			category := strings.TrimSpace(m.transactionsCategorySpend[i].category)
+			if strings.EqualFold(category, selectedCategory) {
+				timeSeriesCategoryLabel = category
+				timeSeriesColor = transactionsCategoryColor(i)
+				break
+			}
+		}
+	}
+	tableLines := renderTransactionsBodyLines(
+		m.transactionsViewMode,
+		m.transactionsRows,
+		chartSpendForCard,
+		timeSeriesForCard,
+		timeSeriesCategoryLabel,
+		timeSeriesColor,
+		timeSeriesSelectedLocal,
+		m.transactionsCursor,
+		merchantW,
+		tableContentWidth,
+		chartCursorInWindow,
+		chartShowAmount,
+	)
+	timeSeriesCardExtraHeight := 0
+	if m.transactionsViewMode == transactionsViewModeTimeSeries {
+		// Match chart-view card+search combined height using measured search box height.
+		searchShell := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#6CBFE6")).
+			Padding(0, 1).
+			Width(tableContentWidth).
+			Render(" ")
+		timeSeriesCardExtraHeight = 1 + lipgloss.Height(searchShell)
+	}
+	tableBodyHeight := m.transactionsChartVisibleRows() + 1 + timeSeriesCardExtraHeight
 	tableLines = padTransactionsBodyLines(tableLines, tableBodyHeight)
 	table := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1134,8 +1808,9 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 			Render(m.transactionsSearchErr))
 	}
 
+	showSearchBar := m.transactionsViewMode != transactionsViewModeTimeSeries
 	searchInput := m.transactionsSearchInput
-	if hasChartPane {
+	if hasChartPane || !showSearchBar {
 		searchInput.SetValue("")
 		searchInput.Placeholder = ""
 	}
@@ -1165,6 +1840,8 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 
 	if hasChartPane {
 		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
+		titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true)
 		chartPaneSorts := transactionsCategoryTransactionSortOptions()
 		chartPaneSortLabel := ""
 		if len(chartPaneSorts) > 0 {
@@ -1178,51 +1855,90 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 			chartPaneSortLabel = "amount ↑"
 		}
 
-		paneHeight := lipgloss.Height(table)
-		if paneHeight < 8 {
-			paneHeight = 8
-		}
-		paneFrameHeight := 4 // border + vertical padding
-		paneInnerHeight := max(1, paneHeight-paneFrameHeight)
-		fixedLines := 2 // column header + hints
-		txVisible := max(1, min(m.transactionsChartPaneVisibleRows(), paneInnerHeight-fixedLines))
-		merchantWidth := min(15, max(6, paneWidth-14))
+		paneOuterHeight := tableBodyHeight + 2
+		// Match main chart card vertical alignment: no top padding so titles share the same row.
+		paneInnerHeight := max(1, paneOuterHeight-2)
+		amountWidth := 9
+		merchantWidth := min(15, max(6, paneWidth-(amountWidth+6)))
 
-		paneLines := []string{
-			labelStyle.Render(fmt.Sprintf("  %10s  %-"+strconv.Itoa(merchantWidth)+"s", "amount", "merchant")),
-		}
-		start := max(0, min(m.transactionsChartPaneOffset, len(m.transactionsChartPaneRows)))
-		end := min(len(m.transactionsChartPaneRows), start+txVisible)
-		if start >= end {
-			paneLines = append(paneLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions"))
+		paneLines := []string{}
+		if m.transactionsChartPaneMode == transactionsChartPaneModeDetails {
+			paneLines = append(paneLines, titleStyle.Render("transaction details"))
+			selectedIdx := m.transactionsChartPaneCursor
+			if strings.TrimSpace(m.transactionsChartPaneDetailTxID) != "" {
+				if idx := findCategoryTransactionRowIndex(m.transactionsChartPaneRows, m.transactionsChartPaneDetailTxID); idx >= 0 {
+					selectedIdx = idx
+				}
+			}
+			if selectedIdx < 0 || selectedIdx >= len(m.transactionsChartPaneRows) {
+				paneLines = append(paneLines, labelStyle.Render("transaction not found"))
+			} else {
+				selected := m.transactionsChartPaneRows[selectedIdx]
+				valueWidth := max(10, paneWidth-16)
+				paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("message", selected.message, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("description", selected.description, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("merchant", selected.merchant, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("card method", selected.cardMethod, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("note text", selected.noteText, valueWidth, labelStyle, valueStyle)...)
+			}
+			paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
 		} else {
-			for i := start; i < end; i++ {
-				row := m.transactionsChartPaneRows[i]
-				prefix := "  "
-				if i == m.transactionsChartPaneCursor {
-					prefix = "› "
+			paneLines = make([]string, paneInnerHeight)
+			if paneInnerHeight > 0 {
+				paneLines[0] = titleStyle.Render("category transactions")
+			}
+			if paneInnerHeight > 1 {
+				paneLines[1] = labelStyle.Render(fmt.Sprintf("  %-"+strconv.Itoa(amountWidth)+"s %-"+strconv.Itoa(merchantWidth)+"s", "amount", "merchant"))
+			}
+			sortRow := paneInnerHeight - 1
+			if sortRow >= 0 {
+				paneLines[sortRow] = labelStyle.Render("sort: " + chartPaneSortLabel)
+			}
+
+			listStartRow := 2
+			listEndRow := max(listStartRow, sortRow-1) // keep one blank row above sort at the bottom
+			availableRows := max(0, listEndRow-listStartRow)
+			txVisible := min(m.transactionsChartPaneVisibleRowsForInnerHeight(paneInnerHeight), availableRows)
+			if txVisible > 0 {
+				start := max(0, min(m.transactionsChartPaneOffset, len(m.transactionsChartPaneRows)))
+				end := min(len(m.transactionsChartPaneRows), start+txVisible)
+				if start >= end {
+					paneLines[listStartRow] = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions")
+				} else {
+					for i := start; i < end; i++ {
+						row := m.transactionsChartPaneRows[i]
+						prefix := " "
+						if i == m.transactionsChartPaneCursor {
+							prefix = "›"
+						}
+						merchant := strings.TrimSpace(row.merchant)
+						if merchant == "" {
+							merchant = strings.TrimSpace(row.description)
+						}
+						merchant = truncateDisplayWidth(merchant, merchantWidth)
+						line := fmt.Sprintf("%s %-"+strconv.Itoa(amountWidth)+"s %-"+strconv.Itoa(merchantWidth)+"s", prefix, row.amountValue, merchant)
+						line = truncateDisplayWidth(line, max(8, paneWidth))
+						style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
+						if i == m.transactionsChartPaneCursor {
+							style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+						}
+						targetRow := listStartRow + (i - start)
+						if targetRow >= 0 && targetRow < len(paneLines) {
+							paneLines[targetRow] = style.Render(line)
+						}
+					}
 				}
-				merchant := strings.TrimSpace(row.merchant)
-				if merchant == "" {
-					merchant = strings.TrimSpace(row.description)
-				}
-				merchant = truncateDisplayWidth(merchant, merchantWidth)
-				line := fmt.Sprintf("%s%10s  %-"+strconv.Itoa(merchantWidth)+"s", prefix, row.amountValue, merchant)
-				line = truncateDisplayWidth(line, max(8, paneWidth))
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
-				if i == m.transactionsChartPaneCursor {
-					style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
-				}
-				paneLines = append(paneLines, style.Render(line))
 			}
 		}
-		paneLines = append(paneLines, labelStyle.Render("sort: "+chartPaneSortLabel))
-		paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
 
 		pane := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FFD54A")).
-			Padding(1, 1).
+			BorderForeground(chartPaneBorder).
+			Padding(0, 1).
 			Height(paneInnerHeight).
 			Width(paneWidth).
 			Render(strings.Join(paneLines, "\n"))
@@ -1237,15 +1953,51 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		return strings.Join([]string{title, "", strings.Join(bodyLines, "\n")}, "\n")
 	}
 
-	hasPane := m.transactionsViewMode == transactionsViewModeTable &&
+	hasTableDetailsPane := m.transactionsViewMode == transactionsViewModeTable &&
 		m.transactionsPaneOpen &&
 		len(m.transactionsRows) > 0 &&
 		m.transactionsCursor >= 0 &&
 		m.transactionsCursor < len(m.transactionsRows)
+	hasTimeSeriesDetailsPane := m.transactionsViewMode == transactionsViewModeTimeSeries &&
+		m.transactionsPaneOpen &&
+		len(m.transactionsTimeSeries) > 0
+	hasPane := hasTableDetailsPane || hasTimeSeriesDetailsPane
 	pane := ""
-	leftBeforeFooter := strings.Join([]string{leftTop, "", searchBox}, "\n")
-	if hasPane && m.transactionsViewMode == transactionsViewModeTable {
+	leftBeforeFooter := leftTop
+	if showSearchBar {
+		leftBeforeFooter = strings.Join([]string{leftTop, "", searchBox}, "\n")
+	}
+	if hasTableDetailsPane {
 		selected := m.transactionsRows[m.transactionsCursor]
+		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
+		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details")}
+		valueWidth := max(10, paneWidth-16)
+		paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("message", selected.message, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("description", selected.description, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("merchant", selected.merchant, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("card method", selected.cardMethod, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("note text", selected.noteText, valueWidth, labelStyle, valueStyle)...)
+		paneInnerHeight := max(1, lipgloss.Height(leftBeforeFooter)-2)
+		paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
+
+		pane = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#FFD54A")).
+			Padding(0, 1).
+			Height(paneInnerHeight).
+			Width(paneWidth).
+			Render(strings.Join(paneLines, "\n"))
+	} else if hasTimeSeriesDetailsPane {
+		selectedIdx := m.transactionsTimeSeriesSelection
+		if selectedIdx < 0 || selectedIdx >= len(m.transactionsTimeSeries) {
+			selectedIdx = len(m.transactionsTimeSeries) - 1
+		}
+		selected := m.transactionsTimeSeries[selectedIdx]
 		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
 		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
 		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details")}
