@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +81,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 	toDigits := m.transactionsToDate
 	includeInternal := m.transactionsIncludeInternal
 	sortIdx := m.transactionsSortIdx
+	searchQuery := m.transactionsSearchApplied
 	return func() tea.Msg {
 		if m.db == nil {
 			return loadTransactionsPreviewMsg{err: fmt.Errorf("database is not initialized")}
@@ -99,6 +101,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 			fromDigits,
 			toDigits,
 			includeInternal,
+			searchQuery,
 			sorts[sortIdx].orderBy,
 			page,
 			pageSize,
@@ -208,19 +211,160 @@ func (m model) saveTransactionsFiltersCmd() tea.Cmd {
 	}
 }
 
+func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *[]any) error {
+	if strings.TrimSpace(searchQuery) == "" {
+		return nil
+	}
+
+	parts := splitTransactionsSearchParts(searchQuery)
+	for _, rawPart := range parts {
+		part := strings.TrimSpace(rawPart)
+		if part == "" {
+			return fmt.Errorf("invalid search syntax")
+		}
+		colon := strings.Index(part, ":")
+		if colon <= 0 || colon == len(part)-1 {
+			return fmt.Errorf("invalid search syntax")
+		}
+
+		field := strings.ToLower(strings.TrimSpace(part[:colon]))
+		value := strings.TrimSpace(part[colon+1:])
+		if value == "" {
+			return fmt.Errorf("invalid search syntax")
+		}
+
+		switch field {
+		case "merchant":
+			*where = append(*where, `LOWER(COALESCE(
+				NULLIF(t.merchant_norm, ''),
+				NULLIF(t.raw_text_norm, ''),
+				NULLIF(t.description_norm, ''),
+				COALESCE(t.raw_text, t.description, '')
+			)) LIKE ?`)
+			*args = append(*args, "%"+strings.ToLower(value)+"%")
+		case "description":
+			*where = append(*where, `LOWER(COALESCE(
+				NULLIF(t.description_norm, ''),
+				COALESCE(t.description, '')
+			)) LIKE ?`)
+			*args = append(*args, "%"+strings.ToLower(value)+"%")
+		case "category":
+			*where = append(*where, "LOWER(COALESCE(t.category_id, '')) LIKE ?")
+			*args = append(*args, "%"+strings.ToLower(value)+"%")
+		case "type":
+			sign, ok := parseTransactionTypeValue(value)
+			if !ok {
+				return fmt.Errorf("invalid search syntax")
+			}
+			if sign > 0 {
+				*where = append(*where, "t.amount_value_in_base_units > 0")
+			} else {
+				*where = append(*where, "t.amount_value_in_base_units < 0")
+			}
+		case "amount":
+			op, cents, ok := parseTransactionAmountValue(value)
+			if !ok {
+				return fmt.Errorf("invalid search syntax")
+			}
+			*where = append(*where, fmt.Sprintf("ABS(t.amount_value_in_base_units) %s ?", op))
+			*args = append(*args, cents)
+		default:
+			return fmt.Errorf("invalid search syntax")
+		}
+	}
+
+	return nil
+}
+
+func splitTransactionsSearchParts(searchQuery string) []string {
+	trimmed := strings.TrimSpace(searchQuery)
+	if trimmed == "" {
+		return nil
+	}
+
+	parts := make([]string, 0, 4)
+	start := 0
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] != '+' {
+			continue
+		}
+		if i == 0 || i == len(trimmed)-1 {
+			continue
+		}
+		if !isWhitespaceByte(trimmed[i-1]) || !isWhitespaceByte(trimmed[i+1]) {
+			continue
+		}
+		parts = append(parts, strings.TrimSpace(trimmed[start:i]))
+		start = i + 1
+	}
+	parts = append(parts, strings.TrimSpace(trimmed[start:]))
+	return parts
+}
+
+func isWhitespaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+func parseTransactionTypeValue(value string) (int, bool) {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "+ve", "positive", "credit", "income":
+		return 1, true
+	case "-ve", "negative", "debit", "expense", "spend":
+		return -1, true
+	default:
+		return 0, false
+	}
+}
+
+func parseTransactionAmountValue(value string) (string, int64, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return "", 0, false
+	}
+
+	op := "="
+	for _, candidate := range []string{">=", "<=", ">", "<", "="} {
+		if strings.HasPrefix(v, candidate) {
+			op = candidate
+			v = strings.TrimSpace(strings.TrimPrefix(v, candidate))
+			break
+		}
+	}
+	if v == "" {
+		return "", 0, false
+	}
+
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	cents := int64(math.Round(math.Abs(n) * 100))
+	return op, cents, true
+}
+
 func queryTransactionsPreview(
 	db *sql.DB,
 	fromDigits string,
 	toDigits string,
 	includeInternal bool,
+	searchQuery string,
 	orderBy string,
 	page int,
 	pageSize int,
 ) ([]transactionPreviewRow, *time.Time, int, int, error) {
-	where := []string{"1=1"}
+	where := []string{"t.is_active = 1"}
 	args := make([]any, 0, 8)
 	if !includeInternal {
 		where = append(where, "t.transfer_account_id IS NULL")
+	}
+	if err := appendTransactionsSearchClauses(strings.TrimSpace(searchQuery), &where, &args); err != nil {
+		return nil, nil, 0, 0, err
 	}
 
 	if len(strings.TrimSpace(fromDigits)) == 8 {
@@ -529,7 +673,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
 			Width(tableOuterWidth).
 			Align(lipgloss.Center).
-			Render("f to filter  s sort  ←/→ page  ↑/↓ row"),
+			Render("enter apply search  |  f filters  s sort  ←/→ page  ↑/↓ row"),
 	}
 
 	statusLines := []string{}
@@ -557,44 +701,80 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 			Foreground(lipgloss.Color("#F15B5B")).
 			Render("error: "+m.transactionsErr))
 	}
+	if strings.TrimSpace(m.transactionsSearchErr) != "" {
+		statusLines = append(statusLines, lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F15B5B")).
+			Render(m.transactionsSearchErr))
+	}
 
-	panelLines := []string{sortLine, "", table, "", "", "", strings.Join(footer, "\n")}
+	searchInput := m.transactionsSearchInput
+	searchInnerWidth := max(8, tableOuterWidth-4)
+	searchInput.Width = max(6, searchInnerWidth-2)
+	searchBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#6CBFE6")).
+		Padding(0, 1).
+		Width(searchInnerWidth).
+		Render(searchInput.View())
+
+	leftTop := strings.Join([]string{sortLine, "", table}, "\n")
+	footerBlock := strings.Join(footer, "\n")
+	statusBlock := ""
 	if len(statusLines) > 0 {
 		centeredStatus := make([]string, 0, len(statusLines))
 		for _, line := range statusLines {
 			centeredStatus = append(centeredStatus, lipgloss.NewStyle().Width(tableOuterWidth).Align(lipgloss.Center).Render(line))
 		}
-		panelLines = append(panelLines, "", strings.Join(centeredStatus, "\n"))
+		statusBlock = strings.Join(centeredStatus, "\n")
 	}
-	leftPanel := strings.Join(panelLines, "\n")
 
-	if !m.transactionsPaneOpen || len(m.transactionsRows) == 0 || m.transactionsCursor < 0 || m.transactionsCursor >= len(m.transactionsRows) {
+	hasPane := m.transactionsPaneOpen &&
+		len(m.transactionsRows) > 0 &&
+		m.transactionsCursor >= 0 &&
+		m.transactionsCursor < len(m.transactionsRows)
+	pane := ""
+	leftBeforeFooter := strings.Join([]string{leftTop, "", searchBox}, "\n")
+	if hasPane {
+		selected := m.transactionsRows[m.transactionsCursor]
+		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
+		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details"), ""}
+		valueWidth := max(10, paneWidth-16)
+		paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("message", selected.message, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("description", selected.description, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("merchant", selected.merchant, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("card method", selected.cardMethod, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("note text", selected.noteText, valueWidth, labelStyle, valueStyle)...)
+
+		pane = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#FFD54A")).
+			MarginTop(2).
+			Padding(1, 1).
+			Width(paneWidth).
+			Render(strings.Join(paneLines, "\n"))
+
+		preSearchHeight := max(lipgloss.Height(leftTop), lipgloss.Height(pane)-lipgloss.Height(searchBox))
+		spacerRows := max(0, preSearchHeight-lipgloss.Height(leftTop))
+		leftBeforeFooter = leftTop
+		if spacerRows > 0 {
+			leftBeforeFooter += "\n" + strings.Repeat("\n", spacerRows-1)
+		}
+		leftBeforeFooter += "\n" + searchBox
+	}
+
+	leftPanel := strings.Join([]string{leftBeforeFooter, "", footerBlock}, "\n")
+	if statusBlock != "" {
+		leftPanel += "\n\n" + statusBlock
+	}
+	if !hasPane {
 		leftPanel = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, leftPanel)
 		return strings.Join([]string{title, "", leftPanel}, "\n")
 	}
-
-	selected := m.transactionsRows[m.transactionsCursor]
-	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
-	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
-	paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details"), ""}
-	valueWidth := max(10, paneWidth-16)
-	paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("message", selected.message, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("description", selected.description, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("merchant", selected.merchant, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("card method", selected.cardMethod, valueWidth, labelStyle, valueStyle)...)
-	paneLines = append(paneLines, renderDetailLines("note text", selected.noteText, valueWidth, labelStyle, valueStyle)...)
-
-	pane := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#FFD54A")).
-		MarginTop(2).
-		Padding(1, 1).
-		Width(paneWidth).
-		Render(strings.Join(paneLines, "\n"))
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, strings.Repeat(" ", gapWidth), pane)
 	row = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, row)

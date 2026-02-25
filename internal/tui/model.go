@@ -265,6 +265,9 @@ type model struct {
 	transactionsFilterMode      int
 	transactionsIncludeInternal bool
 	transactionsPaneOpen        bool
+	transactionsSearchInput     textinput.Model
+	transactionsSearchApplied   string
+	transactionsSearchErr       string
 	transactionsCalendarOpen    bool
 	transactionsCalendarMonth   time.Time
 	transactionsCalendarCursor  time.Time
@@ -290,6 +293,11 @@ func New(db *sql.DB) tea.Model {
 	goalInput.Placeholder = "0.00"
 	goalInput.Width = 20
 
+	transactionsSearchInput := textinput.New()
+	transactionsSearchInput.Prompt = "search> "
+	transactionsSearchInput.Placeholder = "merchant: WOO + amount: >60 + type: -ve"
+	transactionsSearchInput.Width = 72
+
 	return model{
 		db: db,
 		viewItems: []string{
@@ -313,6 +321,7 @@ func New(db *sql.DB) tea.Model {
 		transactionsPageSize:        8,
 		transactionsFilterMode:      transactionsFilterModeQuick,
 		transactionsIncludeInternal: true,
+		transactionsSearchInput:     transactionsSearchInput,
 	}
 }
 
@@ -331,6 +340,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.cmd.Width = max(40, msg.Width-36)
 		m.pat.Width = max(24, msg.Width-40)
+		m.transactionsSearchInput.Width = max(24, msg.Width-36)
 		return m, nil
 
 	case checkConnectionMsg:
@@ -850,6 +860,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.screen == screenTransactions &&
+			strings.TrimSpace(m.cmd.Value()) == "" &&
+			!m.shouldShowCommandSuggestions() {
+			switch msg.Type {
+			case tea.KeyRunes:
+				if len(msg.Runes) == 1 && msg.Runes[0] == '/' && strings.TrimSpace(m.transactionsSearchInput.Value()) == "" {
+					break
+				}
+				var cmd tea.Cmd
+				m.transactionsSearchInput, cmd = m.transactionsSearchInput.Update(msg)
+				m.transactionsSearchErr = ""
+				return m, cmd
+			case tea.KeyBackspace, tea.KeyDelete:
+				var cmd tea.Cmd
+				m.transactionsSearchInput, cmd = m.transactionsSearchInput.Update(msg)
+				m.transactionsSearchErr = ""
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "shift+up":
 			if m.screen == screenAccounts &&
@@ -1105,6 +1135,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
+				searchInput := strings.TrimSpace(m.transactionsSearchInput.Value())
+				appliedSearch := strings.TrimSpace(m.transactionsSearchApplied)
+				if searchInput != appliedSearch {
+					if err := validateTransactionsSearchSyntax(searchInput); err != nil {
+						m.transactionsSearchErr = "invalid search syntax, type /help for info"
+						return m, nil
+					}
+					m.transactionsSearchApplied = searchInput
+					m.transactionsSearchErr = ""
+					m.transactionsPage = 0
+					m.transactionsCursor = 0
+					return m, m.loadTransactionsPreviewCmd()
+				}
 				if len(m.transactionsRows) == 0 {
 					return m, nil
 				}
@@ -1516,6 +1559,7 @@ func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
 	m.transactionsDateErr = ""
 	m.transactionsFocus = transactionsFocusFromDate
 	m.transactionsPaneOpen = false
+	m.transactionsSearchErr = ""
 	m.transactionsCursor = 0
 	m.transactionsOffset = 0
 	m.transactionsPage = 0
@@ -1777,6 +1821,12 @@ func (m model) transactionsPrewarmCheckCmd() tea.Cmd {
 	}
 }
 
+func validateTransactionsSearchSyntax(query string) error {
+	where := []string{}
+	args := []any{}
+	return appendTransactionsSearchClauses(strings.TrimSpace(query), &where, &args)
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -1976,7 +2026,13 @@ func renderHelpOverlay(maxWidth int) string {
 	for _, cmd := range catalog {
 		commands = append(commands, fmt.Sprintf("%-13s %s", cmd.name, cmd.description))
 	}
-	body := strings.Join(commands, "\n")
+	searchHelp := []string{
+		"",
+		"transactions search:",
+		"merchant: WOO + amount: >60 + category: groceries",
+		"type: +ve or type: -ve",
+	}
+	body := strings.Join(append(commands, searchHelp...), "\n")
 	footer := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#FFD54A")).
 		Bold(true).
