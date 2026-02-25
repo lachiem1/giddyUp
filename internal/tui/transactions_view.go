@@ -1259,7 +1259,6 @@ func renderTransactionsTimeSeriesLines(
 	out = append(out, labelStyle.Render(truncateDisplayWidth(axisPrefix+renderTimeSeriesLabelRow(graphWidth, shiftedTickPositions, tickLabels), innerWidth)))
 	xAxisLabel := lipgloss.NewStyle().Width(graphWidth).Align(lipgloss.Center).Render("date")
 	out = append(out, labelStyle.Render(truncateDisplayWidth(axisPrefix+xAxisLabel, innerWidth)))
-	out = append(out, labelStyle.Render(truncateDisplayWidth(strings.Repeat(" ", yLabelWidth)+"$", innerWidth)))
 
 	out = append(out, labelStyle.Render(truncateDisplayWidth(fmt.Sprintf("total spend: %s", formatTimeSeriesDollar(totalSpend)), innerWidth)))
 	return out
@@ -1917,6 +1916,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 				selected := m.transactionsChartPaneRows[selectedIdx]
 				valueWidth := max(10, paneWidth-16)
 				paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+				paneLines = append(paneLines, renderDetailLines("time", formatTransactionTime(selected.createdAt), valueWidth, labelStyle, valueStyle)...)
 				paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
 				paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
 				paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
@@ -2015,6 +2015,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details")}
 		valueWidth := max(10, paneWidth-16)
 		paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("time", formatTransactionTime(selected.createdAt), valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
@@ -2044,6 +2045,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details")}
 		valueWidth := max(10, paneWidth-16)
 		paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
+		paneLines = append(paneLines, renderDetailLines("time", formatTransactionTime(selected.createdAt), valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("raw text", selected.rawText, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("status", selected.status, valueWidth, labelStyle, valueStyle)...)
@@ -2353,6 +2355,30 @@ func formatTransactionDate(raw string) string {
 		return ts
 	}
 	return t.In(time.Local).Format("2006-01-02")
+}
+
+func formatTransactionTime(raw string) string {
+	ts := strings.TrimSpace(raw)
+	if ts == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err == nil {
+		return t.In(time.Local).Format("15:04")
+	}
+	if parsed, err2 := time.ParseInLocation("2006-01-02T15:04:05", ts, time.Local); err2 == nil {
+		return parsed.Format("15:04")
+	}
+	if parsed, err2 := time.ParseInLocation("2006-01-02 15:04:05", ts, time.Local); err2 == nil {
+		return parsed.Format("15:04")
+	}
+	if idx := strings.Index(ts, "T"); idx >= 0 && idx+6 <= len(ts) {
+		return ts[idx+1 : idx+6]
+	}
+	if len(ts) >= 5 {
+		return ts[:5]
+	}
+	return ts
 }
 
 func truncateRunes(s string, maxLen int) string {
