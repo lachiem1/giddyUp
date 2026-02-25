@@ -268,6 +268,7 @@ type model struct {
 	transactionsSearchInput     textinput.Model
 	transactionsSearchApplied   string
 	transactionsSearchErr       string
+	transactionsSearchActive    bool
 	transactionsCalendarOpen    bool
 	transactionsCalendarMonth   time.Time
 	transactionsCalendarCursor  time.Time
@@ -294,8 +295,8 @@ func New(db *sql.DB) tea.Model {
 	goalInput.Width = 20
 
 	transactionsSearchInput := textinput.New()
-	transactionsSearchInput.Prompt = "search> "
-	transactionsSearchInput.Placeholder = "merchant: WOO + amount: >60 + type: -ve"
+	transactionsSearchInput.Prompt = ""
+	transactionsSearchInput.Placeholder = "type /merchant: WOOL + amount: >60 + type: -ve"
 	transactionsSearchInput.Width = 72
 
 	return model{
@@ -863,20 +864,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenTransactions &&
 			strings.TrimSpace(m.cmd.Value()) == "" &&
 			!m.shouldShowCommandSuggestions() {
-			switch msg.Type {
-			case tea.KeyRunes:
-				if len(msg.Runes) == 1 && msg.Runes[0] == '/' && strings.TrimSpace(m.transactionsSearchInput.Value()) == "" {
-					break
+			if m.transactionsSearchActive {
+				switch msg.String() {
+				case "enter":
+					searchInput := strings.TrimSpace(m.transactionsSearchInput.Value())
+					appliedSearch := strings.TrimSpace(m.transactionsSearchApplied)
+					if searchInput != appliedSearch {
+						if err := validateTransactionsSearchSyntax(searchInput); err != nil {
+							m.transactionsSearchErr = "invalid search syntax, type /help for info"
+							return m, nil
+						}
+						m.transactionsSearchApplied = searchInput
+						m.transactionsSearchErr = ""
+						m.transactionsSearchActive = false
+						m.transactionsPage = 0
+						m.transactionsCursor = 0
+						return m, m.loadTransactionsPreviewCmd()
+					}
+					m.transactionsSearchErr = ""
+					m.transactionsSearchActive = false
+					return m, nil
+				case "esc":
+					m.transactionsSearchActive = false
+					return m, nil
+				default:
+					var cmd tea.Cmd
+					m.transactionsSearchInput, cmd = m.transactionsSearchInput.Update(msg)
+					m.transactionsSearchErr = ""
+					return m, cmd
 				}
-				var cmd tea.Cmd
-				m.transactionsSearchInput, cmd = m.transactionsSearchInput.Update(msg)
+			}
+			if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+				m.transactionsSearchActive = true
+				if strings.TrimSpace(m.transactionsSearchInput.Value()) == "" {
+					m.transactionsSearchInput.SetValue("/")
+				}
+				m.transactionsSearchInput.CursorEnd()
 				m.transactionsSearchErr = ""
-				return m, cmd
-			case tea.KeyBackspace, tea.KeyDelete:
-				var cmd tea.Cmd
-				m.transactionsSearchInput, cmd = m.transactionsSearchInput.Update(msg)
-				m.transactionsSearchErr = ""
-				return m, cmd
+				return m, nil
 			}
 		}
 
@@ -1135,19 +1160,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
-				searchInput := strings.TrimSpace(m.transactionsSearchInput.Value())
-				appliedSearch := strings.TrimSpace(m.transactionsSearchApplied)
-				if searchInput != appliedSearch {
-					if err := validateTransactionsSearchSyntax(searchInput); err != nil {
-						m.transactionsSearchErr = "invalid search syntax, type /help for info"
-						return m, nil
-					}
-					m.transactionsSearchApplied = searchInput
-					m.transactionsSearchErr = ""
-					m.transactionsPage = 0
-					m.transactionsCursor = 0
-					return m, m.loadTransactionsPreviewCmd()
-				}
 				if len(m.transactionsRows) == 0 {
 					return m, nil
 				}
@@ -1560,6 +1572,7 @@ func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
 	m.transactionsFocus = transactionsFocusFromDate
 	m.transactionsPaneOpen = false
 	m.transactionsSearchErr = ""
+	m.transactionsSearchActive = false
 	m.transactionsCursor = 0
 	m.transactionsOffset = 0
 	m.transactionsPage = 0

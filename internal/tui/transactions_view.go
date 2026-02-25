@@ -212,11 +212,12 @@ func (m model) saveTransactionsFiltersCmd() tea.Cmd {
 }
 
 func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *[]any) error {
-	if strings.TrimSpace(searchQuery) == "" {
+	normalized := normalizeTransactionsSearchQuery(searchQuery)
+	if normalized == "" {
 		return nil
 	}
 
-	parts := splitTransactionsSearchParts(searchQuery)
+	parts := splitTransactionsSearchParts(normalized)
 	for _, rawPart := range parts {
 		part := strings.TrimSpace(rawPart)
 		if part == "" {
@@ -274,6 +275,14 @@ func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *
 	}
 
 	return nil
+}
+
+func normalizeTransactionsSearchQuery(searchQuery string) string {
+	trimmed := strings.TrimSpace(searchQuery)
+	if strings.HasPrefix(trimmed, "/") {
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "/"))
+	}
+	return trimmed
 }
 
 func splitTransactionsSearchParts(searchQuery string) []string {
@@ -673,7 +682,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
 			Width(tableOuterWidth).
 			Align(lipgloss.Center).
-			Render("enter apply search  |  f filters  s sort  ←/→ page  ↑/↓ row"),
+			Render("/ focus search  |  enter apply  |  f filters  s sort"),
 	}
 
 	statusLines := []string{}
@@ -708,13 +717,16 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	}
 
 	searchInput := m.transactionsSearchInput
-	searchInnerWidth := max(8, tableOuterWidth-4)
-	searchInput.Width = max(6, searchInnerWidth-2)
+	searchInput.Width = max(6, tableContentWidth)
+	searchBorder := lipgloss.Color("#6CBFE6")
+	if m.transactionsSearchActive {
+		searchBorder = lipgloss.Color("#FFD54A")
+	}
 	searchBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#6CBFE6")).
+		BorderForeground(searchBorder).
 		Padding(0, 1).
-		Width(searchInnerWidth).
+		Width(tableContentWidth).
 		Render(searchInput.View())
 
 	leftTop := strings.Join([]string{sortLine, "", table}, "\n")
