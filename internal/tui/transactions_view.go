@@ -873,7 +873,8 @@ func renderTransactionsChartLines(categorySpend []transactionsCategorySpend, con
 	if showAmount {
 		fixed = 22 // adds 9.2f amount column and spacing
 	}
-	available := max(6, contentWidth-fixed)
+	const rightSlack = 5
+	available := max(6, contentWidth-fixed-rightSlack)
 	labelWidth := min(32, max(6, int(math.Round(float64(available)*0.58))))
 	barWidth := max(3, available-labelWidth)
 	rows := categorySpend
@@ -881,6 +882,9 @@ func renderTransactionsChartLines(categorySpend []transactionsCategorySpend, con
 		dollars := float64(row.spendCents) / 100.0
 		barLen := int(math.Round((float64(row.spendCents) / float64(maxSpendCents)) * float64(barWidth)))
 		barLen = max(1, barLen)
+		if barWidth > 1 {
+			barLen = min(barLen, barWidth-1)
+		}
 		bar := strings.Repeat("█", barLen)
 		label := truncateDisplayWidth(strings.TrimSpace(row.category), labelWidth)
 		prefix := "  "
