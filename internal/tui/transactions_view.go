@@ -81,6 +81,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 	toDigits := m.transactionsToDate
 	includeInternal := m.transactionsIncludeInternal
 	sortIdx := m.transactionsSortIdx
+	viewMode := m.transactionsViewMode
 	searchQuery := m.transactionsSearchApplied
 	return func() tea.Msg {
 		if m.db == nil {
@@ -93,16 +94,20 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 			page = 0
 		}
 		sorts := transactionsSortOptions()
-		if sortIdx < 0 || sortIdx >= len(sorts) {
-			sortIdx = 0
+		orderBy := sorts[0].orderBy
+		if viewMode == transactionsViewModeTable {
+			if sortIdx < 0 || sortIdx >= len(sorts) {
+				sortIdx = 0
+			}
+			orderBy = sorts[sortIdx].orderBy
 		}
-		rows, fetchedAt, total, clampedPage, err := queryTransactionsPreview(
+		rows, categorySpend, fetchedAt, total, clampedPage, err := queryTransactionsPreview(
 			m.db,
 			fromDigits,
 			toDigits,
 			includeInternal,
 			searchQuery,
-			sorts[sortIdx].orderBy,
+			orderBy,
 			page,
 			pageSize,
 		)
@@ -111,9 +116,35 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 		}
 		return loadTransactionsPreviewMsg{
 			rows:          rows,
+			categorySpend: categorySpend,
 			lastFetchedAt: fetchedAt,
 			totalCount:    total,
 			page:          clampedPage,
+		}
+	}
+}
+
+func (m model) loadCategoryTransactionsCmd(category string) tea.Cmd {
+	fromDigits := m.transactionsFromDate
+	toDigits := m.transactionsToDate
+	includeInternal := m.transactionsIncludeInternal
+	searchQuery := m.transactionsSearchApplied
+	return func() tea.Msg {
+		if m.db == nil {
+			return loadCategoryTransactionsMsg{err: fmt.Errorf("database is not initialized")}
+		}
+		rows, err := queryCategoryTransactions(
+			m.db,
+			fromDigits,
+			toDigits,
+			includeInternal,
+			searchQuery,
+			category,
+		)
+		return loadCategoryTransactionsMsg{
+			category: category,
+			rows:     rows,
+			err:      err,
 		}
 	}
 }
@@ -212,7 +243,7 @@ func (m model) saveTransactionsFiltersCmd() tea.Cmd {
 }
 
 func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *[]any) error {
-	if isTransactionsSearchHelpQuery(searchQuery) {
+	if isTransactionsSearchHelpQuery(searchQuery) || isTransactionsSearchResetQuery(searchQuery) {
 		return nil
 	}
 	normalized := normalizeTransactionsSearchQuery(searchQuery)
@@ -253,7 +284,10 @@ func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *
 			)) LIKE ?`)
 			*args = append(*args, "%"+strings.ToLower(value)+"%")
 		case "category":
-			*where = append(*where, "LOWER(COALESCE(t.category_id, '')) LIKE ?")
+			*where = append(*where, "LOWER(COALESCE(NULLIF(TRIM(t.category_id), ''), 'uncategorized')) LIKE ?")
+			*args = append(*args, "%"+strings.ToLower(value)+"%")
+		case "exclude-category":
+			*where = append(*where, "LOWER(COALESCE(NULLIF(TRIM(t.category_id), ''), 'uncategorized')) NOT LIKE ?")
 			*args = append(*args, "%"+strings.ToLower(value)+"%")
 		case "type":
 			sign, ok := parseTransactionTypeValue(value)
@@ -291,6 +325,11 @@ func normalizeTransactionsSearchQuery(searchQuery string) string {
 func isTransactionsSearchHelpQuery(searchQuery string) bool {
 	trimmed := strings.ToLower(strings.TrimSpace(searchQuery))
 	return trimmed == "/help" || trimmed == "help"
+}
+
+func isTransactionsSearchResetQuery(searchQuery string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(searchQuery))
+	return trimmed == "/reset" || trimmed == "reset"
 }
 
 func splitTransactionsSearchParts(searchQuery string) []string {
@@ -374,20 +413,20 @@ func queryTransactionsPreview(
 	orderBy string,
 	page int,
 	pageSize int,
-) ([]transactionPreviewRow, *time.Time, int, int, error) {
+) ([]transactionPreviewRow, []transactionsCategorySpend, *time.Time, int, int, error) {
 	where := []string{"t.is_active = 1"}
 	args := make([]any, 0, 8)
 	if !includeInternal {
 		where = append(where, "t.transfer_account_id IS NULL")
 	}
 	if err := appendTransactionsSearchClauses(strings.TrimSpace(searchQuery), &where, &args); err != nil {
-		return nil, nil, 0, 0, err
+		return nil, nil, nil, 0, 0, err
 	}
 
 	if len(strings.TrimSpace(fromDigits)) == 8 {
 		fromDate, err := parseTransactionsDateDigits(fromDigits)
 		if err != nil {
-			return nil, nil, 0, 0, err
+			return nil, nil, nil, 0, 0, err
 		}
 		where = append(where, "date(t.created_at) >= date(?)")
 		args = append(args, fromDate)
@@ -395,7 +434,7 @@ func queryTransactionsPreview(
 	if len(strings.TrimSpace(toDigits)) == 8 {
 		toDate, err := parseTransactionsDateDigits(toDigits)
 		if err != nil {
-			return nil, nil, 0, 0, err
+			return nil, nil, nil, 0, 0, err
 		}
 		where = append(where, "date(t.created_at) <= date(?)")
 		args = append(args, toDate)
@@ -404,7 +443,7 @@ func queryTransactionsPreview(
 		fromDate, _ := parseTransactionsDateDigits(fromDigits)
 		toDate, _ := parseTransactionsDateDigits(toDigits)
 		if fromDate > toDate {
-			return nil, nil, 0, 0, fmt.Errorf("from date cannot be after to date")
+			return nil, nil, nil, 0, 0, fmt.Errorf("from date cannot be after to date")
 		}
 	}
 
@@ -415,7 +454,7 @@ func queryTransactionsPreview(
 		fmt.Sprintf("SELECT COUNT(*) FROM transactions t WHERE %s", whereSQL),
 		args...,
 	).Scan(&total); err != nil {
-		return nil, nil, 0, 0, err
+		return nil, nil, nil, 0, 0, err
 	}
 
 	if pageSize <= 0 {
@@ -465,7 +504,7 @@ func queryTransactionsPreview(
 	pageArgs := append(append([]any{}, args...), pageSize, offset)
 	rows, err := db.QueryContext(context.Background(), q, pageArgs...)
 	if err != nil {
-		return nil, nil, 0, 0, err
+		return nil, nil, nil, 0, 0, err
 	}
 	defer rows.Close()
 
@@ -486,26 +525,155 @@ func queryTransactionsPreview(
 			&r.noteText,
 			&r.accountName,
 		); err != nil {
-			return nil, nil, 0, 0, err
+			return nil, nil, nil, 0, 0, err
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, 0, 0, err
+		return nil, nil, nil, 0, 0, err
+	}
+
+	categorySpend, err := queryCategorySpend(context.Background(), db, whereSQL, args)
+	if err != nil {
+		return nil, nil, nil, 0, 0, err
 	}
 
 	var lastSuccess *time.Time
 	stateRepo := storage.NewSyncStateRepo(db)
 	state, found, err := stateRepo.Get(context.Background(), syncer.CollectionTransactions)
 	if err != nil {
-		return nil, nil, 0, 0, err
+		return nil, nil, nil, 0, 0, err
 	}
 	if found && state.LastSuccess != nil {
 		t := state.LastSuccess.UTC()
 		lastSuccess = &t
 	}
 
-	return out, lastSuccess, total, page, nil
+	return out, categorySpend, lastSuccess, total, page, nil
+}
+
+func queryCategoryTransactions(
+	db *sql.DB,
+	fromDigits string,
+	toDigits string,
+	includeInternal bool,
+	searchQuery string,
+	category string,
+) ([]categoryTransactionRow, error) {
+	where := []string{"t.is_active = 1"}
+	args := make([]any, 0, 10)
+	if !includeInternal {
+		where = append(where, "t.transfer_account_id IS NULL")
+	}
+	if err := appendTransactionsSearchClauses(strings.TrimSpace(searchQuery), &where, &args); err != nil {
+		return nil, err
+	}
+	if len(strings.TrimSpace(fromDigits)) == 8 {
+		fromDate, err := parseTransactionsDateDigits(fromDigits)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "date(t.created_at) >= date(?)")
+		args = append(args, fromDate)
+	}
+	if len(strings.TrimSpace(toDigits)) == 8 {
+		toDate, err := parseTransactionsDateDigits(toDigits)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "date(t.created_at) <= date(?)")
+		args = append(args, toDate)
+	}
+	categoryNorm := strings.ToLower(strings.TrimSpace(category))
+	where = append(where, "LOWER(COALESCE(NULLIF(TRIM(t.category_id), ''), 'uncategorized')) = ?")
+	args = append(args, categoryNorm)
+
+	whereSQL := strings.Join(where, " AND ")
+	q := fmt.Sprintf(
+		`SELECT
+			t.id,
+			t.created_at,
+			COALESCE(
+				NULLIF(t.merchant_norm, ''),
+				COALESCE(
+					NULLIF(t.raw_text_norm, ''),
+					NULLIF(t.description_norm, ''),
+					COALESCE(t.raw_text, t.description, '')
+				)
+			) AS merchant,
+			COALESCE(NULLIF(t.description_norm, ''), COALESCE(t.description, '')) AS description,
+			t.amount_value
+		 FROM transactions t
+		 WHERE %s
+		 ORDER BY t.amount_value_in_base_units DESC, t.created_at DESC, t.id DESC`,
+		whereSQL,
+	)
+
+	rows, err := db.QueryContext(context.Background(), q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]categoryTransactionRow, 0, 64)
+	for rows.Next() {
+		var r categoryTransactionRow
+		if err := rows.Scan(&r.id, &r.createdAt, &r.merchant, &r.description, &r.amountValue); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func queryCategorySpend(ctx context.Context, db *sql.DB, whereSQL string, args []any) ([]transactionsCategorySpend, error) {
+	q := fmt.Sprintf(
+		`SELECT
+			COALESCE(NULLIF(TRIM(t.category_id), ''), 'uncategorized') AS category,
+			SUM(CASE WHEN t.amount_value_in_base_units < 0 THEN -t.amount_value_in_base_units ELSE 0 END) AS spend_cents
+		 FROM transactions t
+		 WHERE %s
+		 GROUP BY category
+		 HAVING spend_cents > 0
+		 ORDER BY spend_cents DESC, category ASC`,
+		whereSQL,
+	)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]transactionsCategorySpend, 0, 16)
+	var total int64
+	for rows.Next() {
+		var r transactionsCategorySpend
+		if err := rows.Scan(&r.category, &r.spendCents); err != nil {
+			return nil, err
+		}
+		total += r.spendCents
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if total <= 0 {
+		return out, nil
+	}
+	for i := range out {
+		out[i].percentOfSpend = (float64(out[i].spendCents) / float64(total)) * 100.0
+	}
+	return out, nil
+}
+
+func chartFooterHelpText(mode int) string {
+	if mode == transactionsViewModeTable {
+		return "1 table  2 chart  |  / search  f filters  s sort"
+	}
+	return "1 table  2 chart  |  / search  f filters"
 }
 
 func (m model) syncTransactionsCmd(sessionID int, force bool) tea.Cmd {
@@ -600,6 +768,139 @@ func waitForTransactionsSyncResult(
 	}
 }
 
+func renderTransactionsViewModeSelector(mode int) string {
+	item := func(label string, active bool) string {
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+		if active {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+		}
+		return style.Render(label)
+	}
+	return "view: " +
+		item("table", mode == transactionsViewModeTable) +
+		" | " +
+		item("chart", mode == transactionsViewModeChart)
+}
+
+func renderTransactionsBodyLines(mode int, rows []transactionPreviewRow, categorySpend []transactionsCategorySpend, cursor int, merchantW int, contentWidth int, chartCursor int, chartShowAmount bool) []string {
+	switch mode {
+	case transactionsViewModeChart:
+		return renderTransactionsChartLines(categorySpend, contentWidth, chartCursor, chartShowAmount)
+	default:
+		return renderTransactionsTableLines(rows, cursor, merchantW)
+	}
+}
+
+func padTransactionsBodyLines(lines []string, target int) []string {
+	if target <= 0 {
+		return lines
+	}
+	if len(lines) >= target {
+		return lines[:target]
+	}
+	out := append([]string{}, lines...)
+	for len(out) < target {
+		out = append(out, "")
+	}
+	return out
+}
+
+func transactionsCategoryPalette() []lipgloss.Color {
+	return []lipgloss.Color{
+		"#E53935", "#1E88E5", "#43A047", "#FB8C00", "#8E24AA", "#00897B",
+		"#F4511E", "#3949AB", "#7CB342", "#D81B60", "#00ACC1", "#6D4C41",
+		"#5E35B1", "#C0CA33", "#039BE5", "#FDD835", "#8D6E63", "#00C853",
+		"#FF7043", "#546E7A", "#AEEA00", "#26A69A", "#EF5350", "#7E57C2",
+		"#29B6F6", "#9CCC65", "#FFCA28", "#AB47BC", "#66BB6A", "#EC407A",
+	}
+}
+
+func transactionsCategoryColor(rank int) lipgloss.Color {
+	palette := transactionsCategoryPalette()
+	if len(palette) == 0 {
+		return lipgloss.Color("#D1D5DB")
+	}
+	if rank < 0 {
+		rank = 0
+	}
+	return palette[rank%len(palette)]
+}
+
+func renderTransactionsTableLines(rows []transactionPreviewRow, cursor int, merchantW int) []string {
+	header := fmt.Sprintf("  %-10s  %-"+strconv.Itoa(merchantW)+"s  %10s", "date", "merchant", "amount")
+	out := []string{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render(header),
+	}
+	if len(rows) == 0 {
+		return append(out, lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions found"))
+	}
+	for i, row := range rows {
+		prefix := "  "
+		if i == cursor {
+			prefix = "› "
+		}
+		date := formatTransactionDate(row.createdAt)
+		merchant := truncateDisplayWidth(strings.TrimSpace(row.merchant), merchantW)
+		line := fmt.Sprintf("%s%-10s  %-"+strconv.Itoa(merchantW)+"s  %10s", prefix, date, merchant, row.amountValue)
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
+		if i == cursor {
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+		}
+		out = append(out, style.Render(line))
+	}
+	return out
+}
+
+func renderTransactionsChartLines(categorySpend []transactionsCategorySpend, contentWidth int, chartCursor int, showAmount bool) []string {
+	out := []string{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("spend by category"),
+	}
+	if len(categorySpend) == 0 {
+		return append(out, lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions found"))
+	}
+
+	maxSpendCents := int64(1)
+	for _, c := range categorySpend {
+		if c.spendCents > maxSpendCents {
+			maxSpendCents = c.spendCents
+		}
+	}
+	if maxSpendCents <= 0 {
+		maxSpendCents = 1
+	}
+	// Fit each chart row to the current content width to avoid wrapping.
+	fixed := 12 // prefix + spaces + pct
+	if showAmount {
+		fixed = 22 // adds 9.2f amount column and spacing
+	}
+	available := max(6, contentWidth-fixed)
+	labelWidth := min(32, max(6, int(math.Round(float64(available)*0.58))))
+	barWidth := max(3, available-labelWidth)
+	rows := categorySpend
+	for i, row := range rows {
+		dollars := float64(row.spendCents) / 100.0
+		barLen := int(math.Round((float64(row.spendCents) / float64(maxSpendCents)) * float64(barWidth)))
+		barLen = max(1, barLen)
+		bar := strings.Repeat("█", barLen)
+		label := truncateDisplayWidth(strings.TrimSpace(row.category), labelWidth)
+		prefix := "  "
+		if i == chartCursor {
+			prefix = "› "
+		}
+		line := fmt.Sprintf("%s%-"+strconv.Itoa(labelWidth)+"s  %s  %5.1f%%", prefix, label, bar, row.percentOfSpend)
+		if showAmount {
+			line = fmt.Sprintf("%s%-"+strconv.Itoa(labelWidth)+"s  %9.2f  %s  %5.1f%%", prefix, label, dollars, bar, row.percentOfSpend)
+		}
+		line = truncateDisplayWidth(line, max(8, contentWidth))
+		style := lipgloss.NewStyle().Foreground(transactionsCategoryColor(i))
+		if i == chartCursor {
+			style = lipgloss.NewStyle().Foreground(transactionsCategoryColor(i)).Bold(true)
+		}
+		out = append(out, style.Render(line))
+	}
+	return out
+}
+
 func (m model) renderTransactionsScreen(layoutWidth int) string {
 	title := renderTransactionsTitle()
 	title = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, title)
@@ -615,7 +916,8 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	maxTableWidth := max(36, min(layoutWidth-8, 82))
 	paneWidth := 40
 	gapWidth := 3
-	if m.transactionsPaneOpen {
+	hasChartPane := m.transactionsViewMode == transactionsViewModeChart && m.transactionsChartPaneOpen
+	if m.transactionsPaneOpen || hasChartPane {
 		paneWidth = max(30, min(40, layoutWidth/3))
 		maxLeft := layoutWidth - paneWidth - gapWidth - 2
 		maxTableWidth = min(maxTableWidth, max(36, maxLeft))
@@ -636,41 +938,81 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		baseRowWidth = txPrefixWidth + txDateWidth + txGapWidth + merchantW + txGapWidth + txAmountWidth
 		tableContentWidth = baseRowWidth + txLineSlack
 	}
-	header := fmt.Sprintf("  %-10s  %-"+strconv.Itoa(merchantW)+"s  %10s", "date", "merchant", "amount")
-	tableLines := []string{
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render(header),
-	}
-	if len(m.transactionsRows) == 0 {
-		tableLines = append(tableLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions found"))
-	} else {
-		for i, row := range m.transactionsRows {
-			prefix := "  "
-			if i == m.transactionsCursor {
-				prefix = "› "
+	if m.transactionsViewMode == transactionsViewModeChart {
+		chartTarget := int(math.Round(float64(tableContentWidth) * 1.5))
+		if chartTarget > maxTableWidth {
+			chartTarget = maxTableWidth
+		}
+		tableContentWidth = max(tableContentWidth, chartTarget)
+		if hasChartPane {
+			// Allocate widths from available layout space (responsive), prioritizing single-line rows.
+			totalContent := max(20, layoutWidth-gapWidth-8) // subtract two cards' border+padding overhead.
+			paneWidth = int(math.Round(float64(totalContent) * 0.40))
+			tableContentWidth = totalContent - paneWidth
+
+			minPane := min(28, max(12, totalContent/3))
+			minMain := min(24, max(12, totalContent/3))
+			if paneWidth < minPane {
+				paneWidth = minPane
+				tableContentWidth = totalContent - paneWidth
 			}
-			date := formatTransactionDate(row.createdAt)
-			merchant := truncateDisplayWidth(strings.TrimSpace(row.merchant), merchantW)
-			amount := row.amountValue
-			line := fmt.Sprintf("%s%-10s  %-"+strconv.Itoa(merchantW)+"s  %10s", prefix, date, merchant, amount)
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
-			if i == m.transactionsCursor {
-				style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+			if tableContentWidth < minMain {
+				tableContentWidth = minMain
+				paneWidth = totalContent - tableContentWidth
 			}
-			tableLines = append(tableLines, style.Render(line))
+			if paneWidth < 12 {
+				paneWidth = 12
+				tableContentWidth = totalContent - paneWidth
+			}
+			if tableContentWidth < 12 {
+				tableContentWidth = 12
+				paneWidth = totalContent - tableContentWidth
+				if paneWidth < 8 {
+					paneWidth = 8
+				}
+			}
 		}
 	}
+	chartSpendForCard := m.transactionsCategorySpend
+	chartCursorInWindow := m.transactionsChartCursor
+	if m.transactionsViewMode == transactionsViewModeChart {
+		startIdx := max(0, min(m.transactionsChartOffset, max(0, len(m.transactionsCategorySpend)-1)))
+		endIdx := min(len(m.transactionsCategorySpend), startIdx+m.transactionsChartVisibleRows())
+		if endIdx < startIdx {
+			endIdx = startIdx
+		}
+		chartSpendForCard = m.transactionsCategorySpend[startIdx:endIdx]
+		chartCursorInWindow = m.transactionsChartCursor - startIdx
+	}
+	chartShowAmount := !hasChartPane
+	tableLines := renderTransactionsBodyLines(m.transactionsViewMode, m.transactionsRows, chartSpendForCard, m.transactionsCursor, merchantW, tableContentWidth, chartCursorInWindow, chartShowAmount)
+	tableBodyHeight := m.transactionsVisibleRows() + 1
+	if m.transactionsViewMode == transactionsViewModeChart {
+		tableBodyHeight = m.transactionsChartVisibleRows() + 1
+	}
+	tableLines = padTransactionsBodyLines(tableLines, tableBodyHeight)
 	table := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(tableBorder).
 		Padding(0, 1).
+		Height(tableBodyHeight).
 		Width(tableContentWidth).
 		Render(strings.Join(tableLines, "\n"))
 	tableOuterWidth := lipgloss.Width(table)
+	viewModeLine := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#9CA3AF")).
+		Width(tableOuterWidth).
+		Align(lipgloss.Center).
+		Render(renderTransactionsViewModeSelector(m.transactionsViewMode))
+	sortLineLabel := "dates: " + rangeLabel
+	if m.transactionsViewMode == transactionsViewModeTable {
+		sortLineLabel = "sort: " + sortLabel + "  |  " + sortLineLabel
+	}
 	sortLine := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#9CA3AF")).
 		Width(tableOuterWidth).
 		Align(lipgloss.Center).
-		Render("sort: " + sortLabel + "  |  dates: " + rangeLabel)
+		Render(sortLineLabel)
 
 	start := 0
 	end := 0
@@ -693,19 +1035,29 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("merchant: case-insensitive match on merchant text"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("description: case-insensitive match on description"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("category: case-insensitive match on category id"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("exclude-category: exclude category matches (repeat to exclude many)"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("amount: numeric compare, e.g. >60, <=12.50, =25"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("type: +ve (credits) or -ve (debits)"),
 		}
 	} else {
-		footer = []string{
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
-				Width(tableOuterWidth).
-				Align(lipgloss.Center).
-				Render(fmt.Sprintf("showing %d-%d/%d  |  page %d/%d", start, end, m.transactionsTotal, m.transactionsPage+1, max(1, totalPages))),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
-				Width(tableOuterWidth).
-				Align(lipgloss.Center).
-				Render("/ focus search  |  enter apply  |  f filters  s sort"),
+		if m.transactionsViewMode == transactionsViewModeTable {
+			footer = []string{
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
+					Width(tableOuterWidth).
+					Align(lipgloss.Center).
+					Render(fmt.Sprintf("showing %d-%d/%d  |  page %d/%d", start, end, m.transactionsTotal, m.transactionsPage+1, max(1, totalPages))),
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
+					Width(tableOuterWidth).
+					Align(lipgloss.Center).
+					Render(chartFooterHelpText(m.transactionsViewMode)),
+			}
+		} else {
+			footer = []string{
+				lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
+					Width(tableOuterWidth).
+					Align(lipgloss.Center).
+					Render(chartFooterHelpText(m.transactionsViewMode)),
+			}
 		}
 	}
 
@@ -741,6 +1093,10 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	}
 
 	searchInput := m.transactionsSearchInput
+	if hasChartPane {
+		searchInput.SetValue("")
+		searchInput.Placeholder = ""
+	}
 	searchInput.Width = max(6, tableContentWidth)
 	searchBorder := lipgloss.Color("#6CBFE6")
 	if m.transactionsSearchActive {
@@ -753,7 +1109,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		Width(tableContentWidth).
 		Render(searchInput.View())
 
-	leftTop := strings.Join([]string{sortLine, "", table}, "\n")
+	leftTop := strings.Join([]string{viewModeLine, sortLine, "", table}, "\n")
 	footerBlock := strings.Join(footer, "\n")
 	statusBlock := ""
 	if len(statusLines) > 0 {
@@ -764,13 +1120,84 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		statusBlock = strings.Join(centeredStatus, "\n")
 	}
 
-	hasPane := m.transactionsPaneOpen &&
+	if hasChartPane {
+		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
+		titleCategory := m.transactionsChartPaneTitle
+		if strings.TrimSpace(titleCategory) == "" {
+			titleCategory = "category"
+		}
+
+		paneHeight := lipgloss.Height(table)
+		if paneHeight < 8 {
+			paneHeight = 8
+		}
+		paneFrameHeight := 4 // border + vertical padding
+		paneInnerHeight := max(1, paneHeight-paneFrameHeight)
+		fixedLines := 6 // header+category+hints
+		txVisible := max(1, min(m.transactionsChartPaneVisibleRows(), paneInnerHeight-fixedLines))
+
+		paneLines := []string{
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("category details"),
+			"",
+			labelStyle.Render("category: ") + valueStyle.Render(truncateDisplayWidth(titleCategory, max(8, paneWidth-10))),
+			"",
+		}
+		start := max(0, min(m.transactionsChartPaneOffset, len(m.transactionsChartPaneRows)))
+		end := min(len(m.transactionsChartPaneRows), start+txVisible)
+		if start >= end {
+			paneLines = append(paneLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("no transactions"))
+		} else {
+			for i := start; i < end; i++ {
+				row := m.transactionsChartPaneRows[i]
+				prefix := "  "
+				if i == m.transactionsChartPaneCursor {
+					prefix = "› "
+				}
+				merchant := strings.TrimSpace(row.merchant)
+				if merchant == "" {
+					merchant = strings.TrimSpace(row.description)
+				}
+				merchantWidth := min(15, max(6, paneWidth-14))
+				merchant = truncateDisplayWidth(merchant, merchantWidth)
+				line := fmt.Sprintf("%s%10s  %-"+strconv.Itoa(merchantWidth)+"s", prefix, row.amountValue, merchant)
+				line = truncateDisplayWidth(line, max(8, paneWidth))
+				style := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
+				if i == m.transactionsChartPaneCursor {
+					style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+				}
+				paneLines = append(paneLines, style.Render(line))
+			}
+		}
+		paneLines = append(paneLines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("↑/↓ scroll  esc close"))
+		paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
+
+		pane := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#FFD54A")).
+			Padding(1, 1).
+			Height(paneInnerHeight).
+			Width(paneWidth).
+			Render(strings.Join(paneLines, "\n"))
+
+		cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, table, strings.Repeat(" ", gapWidth), pane)
+		cardsRow = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, cardsRow)
+		footerRow := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, footerBlock)
+		bodyLines := []string{viewModeLine, sortLine, "", cardsRow, "", footerRow}
+		if statusBlock != "" {
+			bodyLines = append(bodyLines, "", lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, statusBlock))
+		}
+		return strings.Join([]string{title, "", strings.Join(bodyLines, "\n")}, "\n")
+	}
+
+	hasPane := m.transactionsViewMode == transactionsViewModeTable &&
+		m.transactionsPaneOpen &&
 		len(m.transactionsRows) > 0 &&
 		m.transactionsCursor >= 0 &&
 		m.transactionsCursor < len(m.transactionsRows)
 	pane := ""
 	leftBeforeFooter := strings.Join([]string{leftTop, "", searchBox}, "\n")
-	if hasPane {
+	if hasPane && m.transactionsViewMode == transactionsViewModeTable {
 		selected := m.transactionsRows[m.transactionsCursor]
 		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
 		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
@@ -802,7 +1229,6 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		}
 		leftBeforeFooter += "\n" + searchBox
 	}
-
 	leftPanel := strings.Join([]string{leftBeforeFooter, "", footerBlock}, "\n")
 	if statusBlock != "" {
 		leftPanel += "\n\n" + statusBlock
