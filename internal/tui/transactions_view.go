@@ -1092,6 +1092,7 @@ func renderTransactionsTimeSeriesLines(
 		seriesColor = lipgloss.Color("#6CBFE6")
 	}
 	lineStyle := lipgloss.NewStyle().Foreground(seriesColor)
+	focusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD54A")).Bold(true)
 	seriesLabelStyle := lipgloss.NewStyle().Foreground(seriesColor).Bold(true)
 
 	out := []string{titleStyle.Render("spend over time")}
@@ -1186,13 +1187,23 @@ func renderTransactionsTimeSeriesLines(
 		prevGridX, prevGridY = gridX, y
 	}
 
+	showLargeNodes := len(points) <= max(14, dataCols/2)
+	nodeChar := '·'
+	selectedNodeChar := '•'
+	if showLargeNodes {
+		nodeChar = '●'
+		selectedNodeChar = '◉'
+	}
+	selectedGridX, selectedGridY := -1, -1
 	for i := range points {
 		gridX := pointX[i] + 1
-		nodeChar := '●'
+		pointNode := nodeChar
 		if i == selectedPoint {
-			nodeChar = '◉'
+			pointNode = selectedNodeChar
+			selectedGridX = gridX
+			selectedGridY = pointY[i]
 		}
-		grid[pointY[i]][gridX] = nodeChar
+		grid[pointY[i]][gridX] = pointNode
 	}
 
 	for row := 0; row < plotHeight; row++ {
@@ -1201,8 +1212,17 @@ func renderTransactionsTimeSeriesLines(
 			axisLabel = formatTimeSeriesDollar(cents)
 		}
 		prefix := fmt.Sprintf("%*s ", yLabelWidth, axisLabel)
-		graphPart := truncateDisplayWidth(string(grid[row]), max(1, innerWidth-lipgloss.Width(prefix)))
-		out = append(out, labelStyle.Render(prefix)+lineStyle.Render(graphPart))
+		maxGraphWidth := max(1, innerWidth-lipgloss.Width(prefix))
+		graphRunes := grid[row]
+		if len(graphRunes) > maxGraphWidth {
+			graphRunes = graphRunes[:maxGraphWidth]
+		}
+		rowSelectedCol := -1
+		if row == selectedGridY && selectedGridX >= 0 && selectedGridX < len(graphRunes) {
+			rowSelectedCol = selectedGridX
+		}
+		graphPart := renderTimeSeriesGraphRow(graphRunes, rowSelectedCol, lineStyle, focusStyle)
+		out = append(out, labelStyle.Render(prefix)+graphPart)
 	}
 
 	axisPrefix := strings.Repeat(" ", yLabelWidth+1)
@@ -1243,6 +1263,19 @@ func renderTransactionsTimeSeriesLines(
 
 	out = append(out, labelStyle.Render(truncateDisplayWidth(fmt.Sprintf("total spend: %s", formatTimeSeriesDollar(totalSpend)), innerWidth)))
 	return out
+}
+
+func renderTimeSeriesGraphRow(graphRunes []rune, selectedCol int, lineStyle lipgloss.Style, focusStyle lipgloss.Style) string {
+	if len(graphRunes) == 0 {
+		return ""
+	}
+	if selectedCol < 0 || selectedCol >= len(graphRunes) {
+		return lineStyle.Render(string(graphRunes))
+	}
+	left := string(graphRunes[:selectedCol])
+	mid := string(graphRunes[selectedCol : selectedCol+1])
+	right := string(graphRunes[selectedCol+1:])
+	return lineStyle.Render(left) + focusStyle.Render(mid) + lineStyle.Render(right)
 }
 
 func drawTransactionsSeriesSegment(grid [][]rune, x0 int, y0 int, x1 int, y1 int, xAxisRow int) {
@@ -1600,14 +1633,22 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	if hasTablePane {
 		tableContentWidth = baseMainContentWidth
 	}
-	if hasChartPane {
+	if hasChartPane || hasTimeSeriesPane {
 		// Allocate widths from available layout space (responsive), prioritizing single-line rows.
 		totalContent := max(20, layoutWidth-gapWidth-8) // subtract two cards' border+padding overhead.
-		paneWidth = int(math.Round(float64(totalContent) * 0.40))
-		tableContentWidth = totalContent - paneWidth
-
+		paneRatio := 0.40
 		minPane := min(28, max(12, totalContent/3))
 		minMain := min(24, max(12, totalContent/3))
+		if hasTimeSeriesPane {
+			// When the details pane is open in time-series, reserve more space for details
+			// and compress the graph card further to prevent wrapping artifacts.
+			paneRatio = 0.44
+			minPane = min(44, max(24, totalContent/3))
+			minMain = min(36, max(20, totalContent/3))
+		}
+		paneWidth = int(math.Round(float64(totalContent) * paneRatio))
+		tableContentWidth = totalContent - paneWidth
+
 		if paneWidth < minPane {
 			paneWidth = minPane
 			tableContentWidth = totalContent - paneWidth
