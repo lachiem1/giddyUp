@@ -135,6 +135,7 @@ type categoryTransactionRow struct {
 
 type loadCategoryTransactionsMsg struct {
 	category string
+	sortIdx  int
 	rows     []categoryTransactionRow
 	err      error
 }
@@ -227,6 +228,11 @@ const (
 	transactionsViewModeChart
 )
 
+const (
+	transactionsChartFocusMain = iota
+	transactionsChartFocusPane
+)
+
 type model struct {
 	db *sql.DB
 
@@ -248,67 +254,69 @@ type model struct {
 	commandSuggestionIndex  int
 	commandSuggestionOffset int
 
-	showHelpOverlay             bool
-	authDialog                  authDialogMode
-	screen                      screenMode
-	connectHint                 string
-	accountsRows                []accountPreviewRow
-	accountsFetched             *time.Time
-	accountsErr                 string
-	accountsLoading             bool
-	accountsCursor              int
-	accountsOffset              int
-	accountsSession             int
-	accountsPaneOpen            bool
-	accountsPaneFocus           int
-	accountsAction              int
-	accountsGoalEditing         bool
-	accountsGoalErr             string
-	accountsGoalInput           textinput.Model
-	configNextPayDigits         string
-	configFrequencyIndex        int
-	configLastSavedDate         string
-	configDateDirty             bool
-	configFocus                 int
-	configErr                   string
-	transactionsRows            []transactionPreviewRow
-	transactionsCategorySpend   []transactionsCategorySpend
-	transactionsCursor          int
-	transactionsOffset          int
-	transactionsErr             string
-	transactionsFetched         *time.Time
-	transactionsSyncing         bool
-	transactionsSession         int
-	transactionsLastSync        *time.Time
-	transactionsPage            int
-	transactionsPageSize        int
-	transactionsTotal           int
-	transactionsFromDate        string
-	transactionsToDate          string
-	transactionsQuickIdx        int
-	transactionsSortIdx         int
-	transactionsViewMode        int
-	transactionsFocus           int
-	transactionsDateErr         string
-	transactionsFilterMode      int
-	transactionsIncludeInternal bool
-	transactionsPaneOpen        bool
-	transactionsSearchInput     textinput.Model
-	transactionsSearchApplied   string
-	transactionsSearchErr       string
-	transactionsSearchActive    bool
-	transactionsChartCursor     int
-	transactionsChartOffset     int
-	transactionsChartPaneOpen   bool
-	transactionsChartPaneRows   []categoryTransactionRow
-	transactionsChartPaneCursor int
-	transactionsChartPaneOffset int
-	transactionsChartPaneTitle  string
-	transactionsCalendarOpen    bool
-	transactionsCalendarMonth   time.Time
-	transactionsCalendarCursor  time.Time
-	transactionsCalendarTarget  int
-	quitting                    bool
+	showHelpOverlay              bool
+	authDialog                   authDialogMode
+	screen                       screenMode
+	connectHint                  string
+	accountsRows                 []accountPreviewRow
+	accountsFetched              *time.Time
+	accountsErr                  string
+	accountsLoading              bool
+	accountsCursor               int
+	accountsOffset               int
+	accountsSession              int
+	accountsPaneOpen             bool
+	accountsPaneFocus            int
+	accountsAction               int
+	accountsGoalEditing          bool
+	accountsGoalErr              string
+	accountsGoalInput            textinput.Model
+	configNextPayDigits          string
+	configFrequencyIndex         int
+	configLastSavedDate          string
+	configDateDirty              bool
+	configFocus                  int
+	configErr                    string
+	transactionsRows             []transactionPreviewRow
+	transactionsCategorySpend    []transactionsCategorySpend
+	transactionsCursor           int
+	transactionsOffset           int
+	transactionsErr              string
+	transactionsFetched          *time.Time
+	transactionsSyncing          bool
+	transactionsSession          int
+	transactionsLastSync         *time.Time
+	transactionsPage             int
+	transactionsPageSize         int
+	transactionsTotal            int
+	transactionsFromDate         string
+	transactionsToDate           string
+	transactionsQuickIdx         int
+	transactionsSortIdx          int
+	transactionsViewMode         int
+	transactionsFocus            int
+	transactionsDateErr          string
+	transactionsFilterMode       int
+	transactionsIncludeInternal  bool
+	transactionsPaneOpen         bool
+	transactionsSearchInput      textinput.Model
+	transactionsSearchApplied    string
+	transactionsSearchErr        string
+	transactionsSearchActive     bool
+	transactionsChartCursor      int
+	transactionsChartOffset      int
+	transactionsChartPaneOpen    bool
+	transactionsChartPaneRows    []categoryTransactionRow
+	transactionsChartPaneCursor  int
+	transactionsChartPaneOffset  int
+	transactionsChartPaneTitle   string
+	transactionsChartPaneSortIdx int
+	transactionsChartPaneFocus   int
+	transactionsCalendarOpen     bool
+	transactionsCalendarMonth    time.Time
+	transactionsCalendarCursor   time.Time
+	transactionsCalendarTarget   int
+	quitting                     bool
 }
 
 func New(db *sql.DB) tea.Model {
@@ -505,24 +513,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.transactionsErr = ""
+		paneWasOpen := m.transactionsChartPaneOpen
+		paneCategory := strings.TrimSpace(m.transactionsChartPaneTitle)
 		m.transactionsRows = msg.rows
 		m.transactionsCategorySpend = msg.categorySpend
 		if len(m.transactionsCategorySpend) == 0 {
 			m.transactionsChartCursor = 0
-		} else if m.transactionsChartCursor >= len(m.transactionsCategorySpend) {
-			m.transactionsChartCursor = len(m.transactionsCategorySpend) - 1
+		} else {
+			if paneWasOpen && paneCategory != "" {
+				for i := range m.transactionsCategorySpend {
+					if strings.EqualFold(strings.TrimSpace(m.transactionsCategorySpend[i].category), paneCategory) {
+						m.transactionsChartCursor = i
+						break
+					}
+				}
+			}
+			if m.transactionsChartCursor >= len(m.transactionsCategorySpend) {
+				m.transactionsChartCursor = len(m.transactionsCategorySpend) - 1
+			}
 		}
 		if m.transactionsChartCursor < 0 {
 			m.transactionsChartCursor = 0
 		}
 		m.ensureTransactionsChartScrollWindow()
-		if m.transactionsChartPaneOpen {
-			m.transactionsChartPaneOpen = false
-			m.transactionsChartPaneRows = nil
-			m.transactionsChartPaneCursor = 0
-			m.transactionsChartPaneOffset = 0
-			m.transactionsChartPaneTitle = ""
-		}
 		m.transactionsFetched = msg.lastFetchedAt
 		m.transactionsTotal = msg.totalCount
 		if msg.page >= 0 {
@@ -532,6 +545,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.transactionsCursor = max(0, len(m.transactionsRows)-1)
 		}
 		m.ensureTransactionsScrollWindow()
+		if paneWasOpen {
+			if paneCategory == "" && len(m.transactionsCategorySpend) > 0 && m.transactionsChartCursor >= 0 && m.transactionsChartCursor < len(m.transactionsCategorySpend) {
+				paneCategory = m.transactionsCategorySpend[m.transactionsChartCursor].category
+			}
+			if strings.TrimSpace(paneCategory) != "" {
+				return m, m.loadCategoryTransactionsCmd(paneCategory, m.transactionsChartPaneSortIdx)
+			}
+		}
 		return m, nil
 
 	case loadCategoryTransactionsMsg:
@@ -540,8 +561,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.transactionsErr = ""
+		if !m.transactionsChartPaneOpen {
+			m.transactionsChartPaneFocus = transactionsChartFocusPane
+		}
 		m.transactionsChartPaneOpen = true
 		m.transactionsChartPaneTitle = msg.category
+		m.transactionsChartPaneSortIdx = msg.sortIdx
 		m.transactionsChartPaneRows = msg.rows
 		m.transactionsChartPaneCursor = 0
 		m.transactionsChartPaneOffset = 0
@@ -1041,6 +1066,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsFocus = (m.transactionsFocus + 1) % 4
 				return m, nil
 			}
+			if m.screen == screenTransactions &&
+				m.transactionsViewMode == transactionsViewModeChart &&
+				m.transactionsChartPaneOpen {
+				if m.transactionsChartPaneFocus == transactionsChartFocusPane {
+					m.transactionsChartPaneFocus = transactionsChartFocusMain
+				} else {
+					m.transactionsChartPaneFocus = transactionsChartFocusPane
+				}
+				return m, nil
+			}
 			if m.screen == screenAccounts && m.accountsPaneOpen {
 				if m.accountsPaneFocus == accountsFocusCards {
 					m.accountsPaneFocus = accountsFocusPane
@@ -1060,6 +1095,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsChartPaneCursor = 0
 				m.transactionsChartPaneOffset = 0
 				m.transactionsChartPaneTitle = ""
+				m.transactionsChartPaneFocus = transactionsChartFocusMain
 				return m, nil
 			}
 			if m.screen == screenTransactionsFilters && m.transactionsCalendarOpen {
@@ -1102,7 +1138,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.screen == screenTransactions {
 				if m.transactionsViewMode == transactionsViewModeChart {
-					if m.transactionsChartPaneOpen {
+					if m.transactionsChartPaneOpen && m.transactionsChartPaneFocus == transactionsChartFocusPane {
 						if m.transactionsChartPaneCursor > 0 {
 							m.transactionsChartPaneCursor--
 							m.ensureTransactionsChartPaneScrollWindow()
@@ -1161,7 +1197,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			if m.screen == screenTransactions {
 				if m.transactionsViewMode == transactionsViewModeChart {
-					if m.transactionsChartPaneOpen {
+					if m.transactionsChartPaneOpen && m.transactionsChartPaneFocus == transactionsChartFocusPane {
 						if m.transactionsChartPaneCursor < len(m.transactionsChartPaneRows)-1 {
 							m.transactionsChartPaneCursor++
 							m.ensureTransactionsChartPaneScrollWindow()
@@ -1300,12 +1336,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
-				!m.shouldShowCommandSuggestions() &&
-				m.transactionsViewMode == transactionsViewModeTable {
-				sorts := transactionsSortOptions()
-				m.transactionsSortIdx = (m.transactionsSortIdx + 1) % len(sorts)
-				m.transactionsPage = 0
-				return m, m.loadTransactionsPreviewCmd()
+				!m.shouldShowCommandSuggestions() {
+				if m.transactionsViewMode == transactionsViewModeChart && m.transactionsChartPaneOpen {
+					sorts := transactionsCategoryTransactionSortOptions()
+					if len(sorts) == 0 {
+						return m, nil
+					}
+					m.transactionsChartPaneSortIdx = (m.transactionsChartPaneSortIdx + 1) % len(sorts)
+					category := strings.TrimSpace(m.transactionsChartPaneTitle)
+					if category == "" {
+						if len(m.transactionsCategorySpend) == 0 || m.transactionsChartCursor < 0 || m.transactionsChartCursor >= len(m.transactionsCategorySpend) {
+							return m, nil
+						}
+						category = m.transactionsCategorySpend[m.transactionsChartCursor].category
+					}
+					return m, m.loadCategoryTransactionsCmd(category, m.transactionsChartPaneSortIdx)
+				}
+				if m.transactionsViewMode == transactionsViewModeTable {
+					sorts := transactionsSortOptions()
+					m.transactionsSortIdx = (m.transactionsSortIdx + 1) % len(sorts)
+					m.transactionsPage = 0
+					return m, m.loadTransactionsPreviewCmd()
+				}
 			}
 		case "1":
 			if m.screen == screenTransactions &&
@@ -1325,6 +1377,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsChartPaneCursor = 0
 				m.transactionsChartPaneOffset = 0
 				m.transactionsChartPaneTitle = ""
+				m.transactionsChartPaneFocus = transactionsChartFocusMain
 				return m, nil
 			}
 		case "3":
@@ -1342,7 +1395,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 					category := m.transactionsCategorySpend[m.transactionsChartCursor].category
-					return m, m.loadCategoryTransactionsCmd(category)
+					return m, m.loadCategoryTransactionsCmd(category, m.transactionsChartPaneSortIdx)
 				}
 				if m.transactionsViewMode != transactionsViewModeTable {
 					return m, nil
@@ -1776,14 +1829,14 @@ func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
 	m.transactionsChartPaneCursor = 0
 	m.transactionsChartPaneOffset = 0
 	m.transactionsChartPaneTitle = ""
+	m.transactionsChartPaneSortIdx = 0
+	m.transactionsChartPaneFocus = transactionsChartFocusMain
 	m.cmd.SetValue("")
 	m.clearCommandSuggestions()
 	m.transactionsCursor = 0
 	m.transactionsOffset = 0
 	m.transactionsPage = 0
-	if m.transactionsPageSize <= 0 {
-		m.transactionsPageSize = 8
-	}
+	m.transactionsPageSize = max(1, m.transactionsVisibleRows())
 	if m.transactionsFromDate == "" && m.transactionsToDate == "" {
 		m.transactionsQuickIdx = 2 // last 3 months
 		m.applyTransactionsQuickRange(m.transactionsQuickIdx)
@@ -1884,7 +1937,7 @@ func (m *model) ensureTransactionsChartPaneScrollWindow() {
 }
 
 func (m model) transactionsVisibleRows() int {
-	return 12
+	return m.transactionsChartVisibleRows()
 }
 
 func (m model) transactionsChartVisibleRows() int {
@@ -1892,7 +1945,7 @@ func (m model) transactionsChartVisibleRows() int {
 }
 
 func (m model) transactionsChartPaneVisibleRows() int {
-	return 16
+	return 12
 }
 
 func (m model) maybeStartTransactionsSyncCmd(force bool) (model, tea.Cmd) {

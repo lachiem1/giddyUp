@@ -88,7 +88,7 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 			return loadTransactionsPreviewMsg{err: fmt.Errorf("database is not initialized")}
 		}
 		if pageSize <= 0 {
-			pageSize = 12
+			pageSize = max(1, m.transactionsVisibleRows())
 		}
 		if page < 0 {
 			page = 0
@@ -124,11 +124,21 @@ func (m model) loadTransactionsPreviewCmd() tea.Cmd {
 	}
 }
 
-func (m model) loadCategoryTransactionsCmd(category string) tea.Cmd {
+func (m model) loadCategoryTransactionsCmd(category string, sortIdx int) tea.Cmd {
 	fromDigits := m.transactionsFromDate
 	toDigits := m.transactionsToDate
 	includeInternal := m.transactionsIncludeInternal
 	searchQuery := m.transactionsSearchApplied
+	sorts := transactionsCategoryTransactionSortOptions()
+	if len(sorts) == 0 {
+		sorts = []transactionSortOption{
+			{label: "amount ↑", orderBy: "t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+		}
+	}
+	if sortIdx < 0 || sortIdx >= len(sorts) {
+		sortIdx = 0
+	}
+	orderBy := sorts[sortIdx].orderBy
 	return func() tea.Msg {
 		if m.db == nil {
 			return loadCategoryTransactionsMsg{err: fmt.Errorf("database is not initialized")}
@@ -140,9 +150,11 @@ func (m model) loadCategoryTransactionsCmd(category string) tea.Cmd {
 			includeInternal,
 			searchQuery,
 			category,
+			orderBy,
 		)
 		return loadCategoryTransactionsMsg{
 			category: category,
+			sortIdx:  sortIdx,
 			rows:     rows,
 			err:      err,
 		}
@@ -559,6 +571,7 @@ func queryCategoryTransactions(
 	includeInternal bool,
 	searchQuery string,
 	category string,
+	orderBy string,
 ) ([]categoryTransactionRow, error) {
 	where := []string{"t.is_active = 1"}
 	args := make([]any, 0, 10)
@@ -589,6 +602,15 @@ func queryCategoryTransactions(
 	args = append(args, categoryNorm)
 
 	whereSQL := strings.Join(where, " AND ")
+	if strings.TrimSpace(orderBy) == "" {
+		sorts := transactionsCategoryTransactionSortOptions()
+		if len(sorts) == 0 {
+			sorts = []transactionSortOption{
+				{label: "amount ↑", orderBy: "t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+			}
+		}
+		orderBy = sorts[0].orderBy
+	}
 	q := fmt.Sprintf(
 		`SELECT
 			t.id,
@@ -605,8 +627,9 @@ func queryCategoryTransactions(
 			t.amount_value
 		 FROM transactions t
 		 WHERE %s
-		 ORDER BY t.amount_value_in_base_units DESC, t.created_at DESC, t.id DESC`,
+		 ORDER BY %s`,
 		whereSQL,
+		orderBy,
 	)
 
 	rows, err := db.QueryContext(context.Background(), q, args...)
@@ -671,9 +694,9 @@ func queryCategorySpend(ctx context.Context, db *sql.DB, whereSQL string, args [
 
 func chartFooterHelpText(mode int) string {
 	if mode == transactionsViewModeTable {
-		return "1 table  2 chart  |  / search  f filters  s sort"
+		return "/ search  f filters  s sort"
 	}
-	return "1 table  2 chart  |  / search  f filters"
+	return "/ search  f filters"
 }
 
 func (m model) syncTransactionsCmd(sessionID int, force bool) tea.Cmd {
@@ -777,9 +800,9 @@ func renderTransactionsViewModeSelector(mode int) string {
 		return style.Render(label)
 	}
 	return "view: " +
-		item("table", mode == transactionsViewModeTable) +
-		" | " +
-		item("chart", mode == transactionsViewModeChart)
+		item("table [1]", mode == transactionsViewModeTable) +
+		"  | " +
+		item("chart [2]", mode == transactionsViewModeChart)
 }
 
 func renderTransactionsBodyLines(mode int, rows []transactionPreviewRow, categorySpend []transactionsCategorySpend, cursor int, merchantW int, contentWidth int, chartCursor int, chartShowAmount bool) []string {
@@ -917,66 +940,68 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	rangeLabel := transactionsRangeLabel(m.transactionsFromDate, m.transactionsToDate)
 
 	tableBorder := lipgloss.Color("#FFFFFF")
-	maxTableWidth := max(36, min(layoutWidth-8, 82))
-	paneWidth := 40
+	mainCap := int(math.Round(float64(layoutWidth) * 0.78))
+	maxMainWidth := min(layoutWidth-8, max(36, mainCap))
+	if maxMainWidth < 20 {
+		maxMainWidth = max(20, layoutWidth-8)
+	}
+	paneWidth := max(30, min(40, layoutWidth/3))
 	gapWidth := 3
+	hasTablePane := m.transactionsViewMode == transactionsViewModeTable && m.transactionsPaneOpen
 	hasChartPane := m.transactionsViewMode == transactionsViewModeChart && m.transactionsChartPaneOpen
-	if m.transactionsPaneOpen || hasChartPane {
-		paneWidth = max(30, min(40, layoutWidth/3))
+	if hasTablePane || hasChartPane {
 		maxLeft := layoutWidth - paneWidth - gapWidth - 2
-		maxTableWidth = min(maxTableWidth, max(36, maxLeft))
+		maxMainWidth = min(maxMainWidth, max(36, maxLeft))
 	}
 	const (
-		txPrefixWidth = 2
-		txDateWidth   = 10
-		txGapWidth    = 2
-		txAmountWidth = 10
-		txLineSlack   = 4
+		txPrefixWidth       = 2
+		txDateWidth         = 10
+		txGapWidth          = 2
+		txAmountWidth       = 10
+		txLineSlack         = 4
+		txBaseMerchantWidth = 30
 	)
-	merchantW := 30
-	baseRowWidth := txPrefixWidth + txDateWidth + txGapWidth + merchantW + txGapWidth + txAmountWidth
-	// Keep explicit breathing room so amount values do not wrap.
-	tableContentWidth := baseRowWidth + txLineSlack
-	if tableContentWidth > maxTableWidth {
-		merchantW = max(12, maxTableWidth-(txPrefixWidth+txDateWidth+txGapWidth+txGapWidth+txAmountWidth+txLineSlack))
-		baseRowWidth = txPrefixWidth + txDateWidth + txGapWidth + merchantW + txGapWidth + txAmountWidth
-		tableContentWidth = baseRowWidth + txLineSlack
+	fixedColumnsWidth := txPrefixWidth + txDateWidth + txGapWidth + txGapWidth + txAmountWidth + txLineSlack
+	baseMainContentWidth := fixedColumnsWidth + txBaseMerchantWidth
+	if baseMainContentWidth > maxMainWidth {
+		baseMainContentWidth = maxMainWidth
 	}
-	if m.transactionsViewMode == transactionsViewModeChart {
-		chartTarget := int(math.Round(float64(tableContentWidth) * 1.5))
-		if chartTarget > maxTableWidth {
-			chartTarget = maxTableWidth
-		}
-		tableContentWidth = max(tableContentWidth, chartTarget)
-		if hasChartPane {
-			// Allocate widths from available layout space (responsive), prioritizing single-line rows.
-			totalContent := max(20, layoutWidth-gapWidth-8) // subtract two cards' border+padding overhead.
-			paneWidth = int(math.Round(float64(totalContent) * 0.40))
-			tableContentWidth = totalContent - paneWidth
+	wideMainContentWidth := min(maxMainWidth, max(baseMainContentWidth, int(math.Round(float64(baseMainContentWidth)*1.5))))
+	tableContentWidth := wideMainContentWidth
+	if hasTablePane {
+		tableContentWidth = baseMainContentWidth
+	}
+	if hasChartPane {
+		// Allocate widths from available layout space (responsive), prioritizing single-line rows.
+		totalContent := max(20, layoutWidth-gapWidth-8) // subtract two cards' border+padding overhead.
+		paneWidth = int(math.Round(float64(totalContent) * 0.40))
+		tableContentWidth = totalContent - paneWidth
 
-			minPane := min(28, max(12, totalContent/3))
-			minMain := min(24, max(12, totalContent/3))
-			if paneWidth < minPane {
-				paneWidth = minPane
-				tableContentWidth = totalContent - paneWidth
-			}
-			if tableContentWidth < minMain {
-				tableContentWidth = minMain
-				paneWidth = totalContent - tableContentWidth
-			}
-			if paneWidth < 12 {
-				paneWidth = 12
-				tableContentWidth = totalContent - paneWidth
-			}
-			if tableContentWidth < 12 {
-				tableContentWidth = 12
-				paneWidth = totalContent - tableContentWidth
-				if paneWidth < 8 {
-					paneWidth = 8
-				}
+		minPane := min(28, max(12, totalContent/3))
+		minMain := min(24, max(12, totalContent/3))
+		if paneWidth < minPane {
+			paneWidth = minPane
+			tableContentWidth = totalContent - paneWidth
+		}
+		if tableContentWidth < minMain {
+			tableContentWidth = minMain
+			paneWidth = totalContent - tableContentWidth
+		}
+		if paneWidth < 12 {
+			paneWidth = 12
+			tableContentWidth = totalContent - paneWidth
+		}
+		if tableContentWidth < 12 {
+			tableContentWidth = 12
+			paneWidth = totalContent - tableContentWidth
+			if paneWidth < 8 {
+				paneWidth = 8
 			}
 		}
+	} else {
+		tableContentWidth = min(tableContentWidth, maxMainWidth)
 	}
+	merchantW := max(6, tableContentWidth-fixedColumnsWidth)
 	chartSpendForCard := m.transactionsCategorySpend
 	chartCursorInWindow := m.transactionsChartCursor
 	if m.transactionsViewMode == transactionsViewModeChart {
@@ -990,10 +1015,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	}
 	chartShowAmount := !hasChartPane
 	tableLines := renderTransactionsBodyLines(m.transactionsViewMode, m.transactionsRows, chartSpendForCard, m.transactionsCursor, merchantW, tableContentWidth, chartCursorInWindow, chartShowAmount)
-	tableBodyHeight := m.transactionsVisibleRows() + 1
-	if m.transactionsViewMode == transactionsViewModeChart {
-		tableBodyHeight = m.transactionsChartVisibleRows() + 1
-	}
+	tableBodyHeight := m.transactionsChartVisibleRows() + 1
 	tableLines = padTransactionsBodyLines(tableLines, tableBodyHeight)
 	table := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1017,6 +1039,8 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		Width(tableOuterWidth).
 		Align(lipgloss.Center).
 		Render(sortLineLabel)
+	viewModeHeader := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, viewModeLine)
+	sortHeader := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, sortLine)
 
 	start := 0
 	end := 0
@@ -1113,7 +1137,8 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		Width(tableContentWidth).
 		Render(searchInput.View())
 
-	leftTop := strings.Join([]string{viewModeLine, sortLine, "", table}, "\n")
+	headerBlock := strings.Join([]string{viewModeHeader, sortHeader}, "\n")
+	leftTop := table
 	footerBlock := strings.Join(footer, "\n")
 	statusBlock := ""
 	if len(statusLines) > 0 {
@@ -1126,10 +1151,17 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 
 	if hasChartPane {
 		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
-		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
-		titleCategory := m.transactionsChartPaneTitle
-		if strings.TrimSpace(titleCategory) == "" {
-			titleCategory = "category"
+		chartPaneSorts := transactionsCategoryTransactionSortOptions()
+		chartPaneSortLabel := ""
+		if len(chartPaneSorts) > 0 {
+			sortIdx := m.transactionsChartPaneSortIdx
+			if sortIdx < 0 || sortIdx >= len(chartPaneSorts) {
+				sortIdx = 0
+			}
+			chartPaneSortLabel = chartPaneSorts[sortIdx].label
+		}
+		if strings.TrimSpace(chartPaneSortLabel) == "" {
+			chartPaneSortLabel = "amount ↑"
 		}
 
 		paneHeight := lipgloss.Height(table)
@@ -1138,14 +1170,12 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		}
 		paneFrameHeight := 4 // border + vertical padding
 		paneInnerHeight := max(1, paneHeight-paneFrameHeight)
-		fixedLines := 6 // header+category+hints
+		fixedLines := 2 // column header + hints
 		txVisible := max(1, min(m.transactionsChartPaneVisibleRows(), paneInnerHeight-fixedLines))
+		merchantWidth := min(15, max(6, paneWidth-14))
 
 		paneLines := []string{
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("category details"),
-			"",
-			labelStyle.Render("category: ") + valueStyle.Render(truncateDisplayWidth(titleCategory, max(8, paneWidth-10))),
-			"",
+			labelStyle.Render(fmt.Sprintf("  %10s  %-"+strconv.Itoa(merchantWidth)+"s", "amount", "merchant")),
 		}
 		start := max(0, min(m.transactionsChartPaneOffset, len(m.transactionsChartPaneRows)))
 		end := min(len(m.transactionsChartPaneRows), start+txVisible)
@@ -1162,7 +1192,6 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 				if merchant == "" {
 					merchant = strings.TrimSpace(row.description)
 				}
-				merchantWidth := min(15, max(6, paneWidth-14))
 				merchant = truncateDisplayWidth(merchant, merchantWidth)
 				line := fmt.Sprintf("%s%10s  %-"+strconv.Itoa(merchantWidth)+"s", prefix, row.amountValue, merchant)
 				line = truncateDisplayWidth(line, max(8, paneWidth))
@@ -1173,7 +1202,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 				paneLines = append(paneLines, style.Render(line))
 			}
 		}
-		paneLines = append(paneLines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Render("↑/↓ scroll  esc close"))
+		paneLines = append(paneLines, labelStyle.Render("sort: "+chartPaneSortLabel))
 		paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
 
 		pane := lipgloss.NewStyle().
@@ -1187,7 +1216,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, table, strings.Repeat(" ", gapWidth), pane)
 		cardsRow = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, cardsRow)
 		footerRow := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, footerBlock)
-		bodyLines := []string{viewModeLine, sortLine, "", cardsRow, "", footerRow}
+		bodyLines := []string{viewModeHeader, sortHeader, "", cardsRow, "", footerRow}
 		if statusBlock != "" {
 			bodyLines = append(bodyLines, "", lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, statusBlock))
 		}
@@ -1205,7 +1234,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		selected := m.transactionsRows[m.transactionsCursor]
 		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
 		valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Bold(true)
-		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details"), ""}
+		paneLines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("#87CEEB")).Bold(true).Render("transaction details")}
 		valueWidth := max(10, paneWidth-16)
 		paneLines = append(paneLines, renderDetailLines("account", selected.accountName, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("category", selected.categoryID, valueWidth, labelStyle, valueStyle)...)
@@ -1216,35 +1245,34 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		paneLines = append(paneLines, renderDetailLines("merchant", selected.merchant, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("card method", selected.cardMethod, valueWidth, labelStyle, valueStyle)...)
 		paneLines = append(paneLines, renderDetailLines("note text", selected.noteText, valueWidth, labelStyle, valueStyle)...)
+		paneInnerHeight := max(1, lipgloss.Height(leftBeforeFooter)-2)
+		paneLines = padTransactionsBodyLines(paneLines, paneInnerHeight)
 
 		pane = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#FFD54A")).
-			MarginTop(2).
-			Padding(1, 1).
+			Padding(0, 1).
+			Height(paneInnerHeight).
 			Width(paneWidth).
 			Render(strings.Join(paneLines, "\n"))
-
-		preSearchHeight := max(lipgloss.Height(leftTop), lipgloss.Height(pane)-lipgloss.Height(searchBox))
-		spacerRows := max(0, preSearchHeight-lipgloss.Height(leftTop))
-		leftBeforeFooter = leftTop
-		if spacerRows > 0 {
-			leftBeforeFooter += "\n" + strings.Repeat("\n", spacerRows-1)
-		}
-		leftBeforeFooter += "\n" + searchBox
 	}
-	leftPanel := strings.Join([]string{leftBeforeFooter, "", footerBlock}, "\n")
-	if statusBlock != "" {
-		leftPanel += "\n\n" + statusBlock
-	}
+	footerRow := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, footerBlock)
 	if !hasPane {
-		leftPanel = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, leftPanel)
-		return strings.Join([]string{title, "", leftPanel}, "\n")
+		leftContent := lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, leftBeforeFooter)
+		bodyLines := []string{leftContent, "", footerRow}
+		if statusBlock != "" {
+			bodyLines = append(bodyLines, "", lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, statusBlock))
+		}
+		return strings.Join([]string{title, "", headerBlock, "", strings.Join(bodyLines, "\n")}, "\n")
 	}
 
-	row := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, strings.Repeat(" ", gapWidth), pane)
-	row = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, row)
-	return strings.Join([]string{title, "", row}, "\n")
+	cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, leftBeforeFooter, strings.Repeat(" ", gapWidth), pane)
+	cardsRow = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, cardsRow)
+	bodyLines := []string{cardsRow, "", footerRow}
+	if statusBlock != "" {
+		bodyLines = append(bodyLines, "", lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, statusBlock))
+	}
+	return strings.Join([]string{title, "", headerBlock, "", strings.Join(bodyLines, "\n")}, "\n")
 }
 
 func (m model) renderTransactionsFiltersScreen(layoutWidth int) string {
@@ -1379,6 +1407,17 @@ func transactionsSortOptions() []transactionSortOption {
 		{label: "merchant Z-A", orderBy: "COALESCE(t.merchant_norm, COALESCE(t.raw_text_norm, t.description_norm, t.raw_text, t.description, '')) DESC, t.created_at DESC, t.id DESC"},
 		{label: "amount ↓", orderBy: "t.amount_value_in_base_units DESC, t.created_at DESC, t.id DESC"},
 		{label: "amount ↑", orderBy: "t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+	}
+}
+
+func transactionsCategoryTransactionSortOptions() []transactionSortOption {
+	return []transactionSortOption{
+		{label: "amount ↑", orderBy: "t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+		{label: "amount ↓", orderBy: "t.amount_value_in_base_units DESC, t.created_at DESC, t.id DESC"},
+		{label: "merchant A-Z", orderBy: "merchant ASC, t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+		{label: "merchant Z-A", orderBy: "merchant DESC, t.amount_value_in_base_units ASC, t.created_at DESC, t.id DESC"},
+		{label: "date ↓", orderBy: "t.created_at DESC, t.id DESC"},
+		{label: "date ↑", orderBy: "t.created_at ASC, t.id ASC"},
 	}
 }
 
