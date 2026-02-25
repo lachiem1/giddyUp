@@ -296,7 +296,7 @@ func New(db *sql.DB) tea.Model {
 
 	transactionsSearchInput := textinput.New()
 	transactionsSearchInput.Prompt = ""
-	transactionsSearchInput.Placeholder = "type /merchant: WOOL + amount: >60 + type: -ve"
+	transactionsSearchInput.Placeholder = "e.g. /merchant: WOOL + amount: >60 + type: -ve"
 	transactionsSearchInput.Width = 72
 
 	return model{
@@ -861,31 +861,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if m.screen == screenTransactions &&
-			strings.TrimSpace(m.cmd.Value()) == "" &&
-			!m.shouldShowCommandSuggestions() {
+		if m.screen == screenTransactions {
 			if m.transactionsSearchActive {
 				switch msg.String() {
 				case "enter":
 					searchInput := strings.TrimSpace(m.transactionsSearchInput.Value())
 					appliedSearch := strings.TrimSpace(m.transactionsSearchApplied)
+					isHelp := isTransactionsSearchHelpQuery(searchInput)
 					if searchInput != appliedSearch {
-						if err := validateTransactionsSearchSyntax(searchInput); err != nil {
-							m.transactionsSearchErr = "invalid search syntax, type /help for info"
-							return m, nil
+						if !isHelp {
+							if err := validateTransactionsSearchSyntax(searchInput); err != nil {
+								m.transactionsSearchErr = "invalid search syntax, type /help for info"
+								return m, nil
+							}
 						}
 						m.transactionsSearchApplied = searchInput
 						m.transactionsSearchErr = ""
+						if isHelp {
+							// Keep focus in search mode while help is displayed.
+							m.transactionsSearchActive = true
+							m.transactionsSearchInput.Focus()
+							return m, m.loadTransactionsPreviewCmd()
+						}
 						m.transactionsSearchActive = false
+						m.transactionsSearchInput.Blur()
 						m.transactionsPage = 0
 						m.transactionsCursor = 0
 						return m, m.loadTransactionsPreviewCmd()
 					}
+					if isHelp {
+						// Enter should not leave search mode while help instructions are active.
+						m.transactionsSearchActive = true
+						m.transactionsSearchInput.Focus()
+						return m, nil
+					}
 					m.transactionsSearchErr = ""
 					m.transactionsSearchActive = false
+					m.transactionsSearchInput.Blur()
 					return m, nil
 				case "esc":
+					if isTransactionsSearchHelpQuery(m.transactionsSearchApplied) {
+						m.transactionsSearchInput.SetValue("")
+						m.transactionsSearchApplied = ""
+						m.transactionsSearchErr = ""
+						m.transactionsSearchActive = false
+						m.transactionsSearchInput.Blur()
+						m.transactionsPage = 0
+						m.transactionsCursor = 0
+						return m, m.loadTransactionsPreviewCmd()
+					}
 					m.transactionsSearchActive = false
+					m.transactionsSearchInput.Blur()
 					return m, nil
 				default:
 					var cmd tea.Cmd
@@ -895,10 +921,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+				m.cmd.SetValue("")
+				m.clearCommandSuggestions()
 				m.transactionsSearchActive = true
 				if strings.TrimSpace(m.transactionsSearchInput.Value()) == "" {
 					m.transactionsSearchInput.SetValue("/")
 				}
+				m.transactionsSearchInput.Focus()
 				m.transactionsSearchInput.CursorEnd()
 				m.transactionsSearchErr = ""
 				return m, nil
@@ -1248,6 +1277,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	if m.screen == screenTransactions && !m.transactionsSearchActive {
+		return m, nil
+	}
+	if m.screen == screenTransactionsFilters {
+		return m, nil
+	}
 	m.cmd, cmd = m.cmd.Update(msg)
 	m.refreshCommandSuggestions()
 	return m, cmd
@@ -1573,6 +1608,11 @@ func (m model) enterTransactionsView() (tea.Model, tea.Cmd) {
 	m.transactionsPaneOpen = false
 	m.transactionsSearchErr = ""
 	m.transactionsSearchActive = false
+	m.transactionsSearchInput.Blur()
+	m.transactionsSearchInput.SetValue("")
+	m.transactionsSearchApplied = ""
+	m.cmd.SetValue("")
+	m.clearCommandSuggestions()
 	m.transactionsCursor = 0
 	m.transactionsOffset = 0
 	m.transactionsPage = 0
