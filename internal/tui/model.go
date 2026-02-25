@@ -95,6 +95,64 @@ type saveConfigMsg struct {
 	silent bool
 }
 
+type payCycleAccountRow struct {
+	id           string
+	displayName  string
+	accountType  string
+	balanceCents int64
+	goalBalance  string
+}
+
+type payCycleTransactionRow struct {
+	id          string
+	createdAt   string
+	merchant    string
+	rawText     string
+	description string
+	amountValue string
+	spendCents  int64
+	status      string
+	message     string
+	categoryID  string
+	cardMethod  string
+	noteText    string
+	accountName string
+}
+
+type payCycleBurndownPoint struct {
+	date           string
+	createdAt      string
+	remainingCents int64
+	hasTransaction bool
+	transactionID  string
+}
+
+type loadPayCycleStateMsg struct {
+	accounts    []payCycleAccountRow
+	nextPayDate string
+	frequency   string
+	err         error
+}
+
+type loadPayCycleSeriesMsg struct {
+	accountID           string
+	startDate           string
+	endDate             string
+	goalCents           int64
+	currentBalanceCents int64
+	points              []payCycleBurndownPoint
+	transactions        []payCycleTransactionRow
+	err                 error
+}
+
+type savePayCycleGoalMsg struct {
+	err error
+}
+
+type savePayCycleConfigMsg struct {
+	err error
+}
+
 type transactionPreviewRow struct {
 	createdAt   string
 	merchant    string
@@ -229,6 +287,7 @@ const (
 	screenConfig
 	screenTransactions
 	screenTransactionsFilters
+	screenPayCycleBurndown
 )
 
 const (
@@ -257,6 +316,18 @@ const (
 const (
 	transactionsChartFocusMain = iota
 	transactionsChartFocusPane
+)
+
+const (
+	payCyclePromptNone = iota
+	payCyclePromptNextDate
+	payCyclePromptFrequency
+	payCyclePromptGoal
+)
+
+const (
+	payCyclePaneFocusMain = iota
+	payCyclePaneFocusDetails
 )
 
 const (
@@ -354,6 +425,25 @@ type model struct {
 	transactionsCalendarMonth        time.Time
 	transactionsCalendarCursor       time.Time
 	transactionsCalendarTarget       int
+	payCycleAccounts                 []payCycleAccountRow
+	payCycleCursor                   int
+	payCycleSeries                   []payCycleBurndownPoint
+	payCycleTransactions             []payCycleTransactionRow
+	payCycleTxCursor                 int
+	payCycleCurrentBalanceCents      int64
+	payCycleGoalCents                int64
+	payCycleStartDate                string
+	payCycleEndDate                  string
+	payCycleNextDate                 string
+	payCycleFrequency                string
+	payCycleErr                      string
+	payCyclePromptMode               int
+	payCyclePromptErr                string
+	payCycleInput                    textinput.Model
+	payCyclePaneOpen                 bool
+	payCyclePaneFocus                int
+	payCycleConfigReturn             bool
+	payCyclePromptGoalAfterConfig    bool
 	quitting                         bool
 }
 
@@ -380,13 +470,17 @@ func New(db *sql.DB) tea.Model {
 	transactionsSearchInput.Placeholder = "e.g. /merchant: WOOL + amount: >60 + type: -ve"
 	transactionsSearchInput.Width = 72
 
+	payCycleInput := textinput.New()
+	payCycleInput.Prompt = "> "
+	payCycleInput.Placeholder = ""
+	payCycleInput.Width = 32
+
 	return model{
 		db: db,
 		viewItems: []string{
 			"config",
 			"accounts",
 			"transactions",
-			"spend categories",
 			"pay cycle burndown",
 		},
 		selected:                    0,
@@ -405,6 +499,7 @@ func New(db *sql.DB) tea.Model {
 		transactionsIncludeInternal: true,
 		transactionsViewMode:        transactionsViewModeTable,
 		transactionsSearchInput:     transactionsSearchInput,
+		payCycleInput:               payCycleInput,
 	}
 }
 
@@ -543,7 +638,103 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.configErr = ""
+		if m.payCycleConfigReturn {
+			m.screen = screenPayCycleBurndown
+			m.payCycleConfigReturn = false
+			m.payCyclePromptGoalAfterConfig = true
+			return m, m.loadPayCycleStateCmd()
+		}
 		return m, nil
+
+	case loadPayCycleStateMsg:
+		if msg.err != nil {
+			m.payCycleErr = msg.err.Error()
+			return m, nil
+		}
+		m.payCycleErr = ""
+		m.payCycleAccounts = msg.accounts
+		m.payCycleNextDate = strings.TrimSpace(msg.nextPayDate)
+		m.payCycleFrequency = strings.TrimSpace(msg.frequency)
+		m.clampPayCycleCursor()
+		m.payCyclePromptErr = ""
+		m.refreshPayCyclePrompt()
+		if m.payCyclePromptGoalAfterConfig && m.payCyclePromptMode == payCyclePromptNone {
+			if account, ok := m.payCycleSelectedAccount(); ok {
+				m.payCyclePromptMode = payCyclePromptGoal
+				m.payCyclePromptErr = ""
+				m.payCycleInput.Placeholder = "0.00"
+				m.payCycleInput.SetValue(strings.TrimSpace(account.goalBalance))
+				m.payCycleInput.Focus()
+			}
+			m.payCyclePromptGoalAfterConfig = false
+		}
+		if m.payCyclePromptMode == payCyclePromptNone {
+			cmd := m.loadPayCycleSeriesCmd()
+			if cmd == nil {
+				m.payCycleSeries = nil
+				m.payCycleTransactions = nil
+				m.payCycleTxCursor = 0
+				m.payCycleCurrentBalanceCents = 0
+				m.payCycleGoalCents = 0
+				m.payCycleStartDate = ""
+				m.payCycleEndDate = ""
+				m.payCyclePaneOpen = false
+				m.payCyclePaneFocus = payCyclePaneFocusMain
+				return m, nil
+			}
+			return m, cmd
+		}
+		m.payCycleSeries = nil
+		m.payCycleTransactions = nil
+		m.payCycleTxCursor = 0
+		m.payCycleCurrentBalanceCents = 0
+		m.payCycleGoalCents = 0
+		m.payCycleStartDate = ""
+		m.payCycleEndDate = ""
+		m.payCyclePaneOpen = false
+		m.payCyclePaneFocus = payCyclePaneFocusMain
+		return m, nil
+
+	case loadPayCycleSeriesMsg:
+		if msg.err != nil {
+			m.payCycleErr = msg.err.Error()
+			return m, nil
+		}
+		account, ok := m.payCycleSelectedAccount()
+		if ok && strings.TrimSpace(msg.accountID) != strings.TrimSpace(account.id) {
+			return m, nil
+		}
+		m.payCycleErr = ""
+		m.payCycleSeries = msg.points
+		m.payCycleTransactions = msg.transactions
+		m.payCycleCurrentBalanceCents = msg.currentBalanceCents
+		m.payCycleGoalCents = msg.goalCents
+		m.payCycleStartDate = msg.startDate
+		m.payCycleEndDate = msg.endDate
+		if len(m.payCycleTransactions) == 0 {
+			m.payCycleTxCursor = 0
+			m.payCyclePaneOpen = false
+			m.payCyclePaneFocus = payCyclePaneFocusMain
+		} else {
+			m.payCycleTxCursor = 0
+		}
+		return m, nil
+
+	case savePayCycleGoalMsg:
+		if msg.err != nil {
+			m.payCyclePromptErr = msg.err.Error()
+			return m, nil
+		}
+		m.payCyclePromptErr = ""
+		return m, m.loadPayCycleStateCmd()
+
+	case savePayCycleConfigMsg:
+		if msg.err != nil {
+			m.payCyclePromptErr = msg.err.Error()
+			return m, nil
+		}
+		m.payCyclePromptErr = ""
+		return m, m.loadPayCycleStateCmd()
 
 	case loadTransactionsPreviewMsg:
 		if msg.err != nil {
@@ -799,6 +990,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			case "esc":
+				if m.payCycleConfigReturn {
+					m.screen = screenPayCycleBurndown
+					m.payCycleConfigReturn = false
+					m.payCyclePromptGoalAfterConfig = false
+					return m, m.loadPayCycleStateCmd()
+				}
 				m.screen = screenHome
 				m.configErr = ""
 				m.cmd.Focus()
@@ -870,6 +1067,88 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.configLastSavedDate = formatted
 					return m, m.saveConfigDateCmd(formatted)
 				}
+			}
+			return m, cmd
+		}
+		if m.screen == screenPayCycleBurndown && m.payCyclePromptMode != payCyclePromptNone {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				m.quitting = true
+				return m, tea.Quit
+			case "esc":
+				if m.payCyclePromptMode == payCyclePromptGoal {
+					m.payCyclePromptMode = payCyclePromptNone
+					m.payCyclePromptErr = ""
+					m.payCycleInput.SetValue("")
+					m.payCycleInput.Blur()
+					cmd := m.loadPayCycleSeriesCmd()
+					if cmd == nil {
+						m.payCycleSeries = nil
+						m.payCycleTransactions = nil
+						m.payCycleTxCursor = 0
+						m.payCycleCurrentBalanceCents = 0
+						m.payCycleGoalCents = 0
+						m.payCycleStartDate = ""
+						m.payCycleEndDate = ""
+						return m, nil
+					}
+					return m, cmd
+				}
+				m.screen = screenHome
+				m.payCyclePromptMode = payCyclePromptNone
+				m.payCyclePromptErr = ""
+				m.payCycleInput.SetValue("")
+				m.payCycleInput.Blur()
+				m.cmd.Focus()
+				return m, nil
+			case "enter":
+				switch m.payCyclePromptMode {
+				case payCyclePromptNextDate:
+					digits := digitsOnly(m.payCycleInput.Value())
+					formatted, err := validateAndFormatDateDigits(digits, true)
+					if err != nil {
+						m.payCyclePromptErr = err.Error()
+						return m, nil
+					}
+					m.payCyclePromptErr = ""
+					m.payCycleNextDate = formatted
+					return m, m.savePayCycleConfigValueCmd(map[string]string{
+						"pay_cycle.next_date": formatted,
+					})
+				case payCyclePromptFrequency:
+					freq, ok := normalizePayCycleFrequency(m.payCycleInput.Value())
+					if !ok {
+						m.payCyclePromptErr = "frequency must be weekly/fortnightly/monthly/quarterly"
+						return m, nil
+					}
+					m.payCyclePromptErr = ""
+					m.payCycleFrequency = freq
+					return m, m.savePayCycleConfigValueCmd(map[string]string{
+						"pay_cycle.frequency": freq,
+					})
+				case payCyclePromptGoal:
+					account, ok := m.payCycleSelectedAccount()
+					if !ok {
+						return m, nil
+					}
+					raw := normalizeGoalInput(m.payCycleInput.Value())
+					goalCents, err := parseGoalBalanceCents(raw)
+					if err != nil {
+						m.payCyclePromptErr = err.Error()
+						return m, nil
+					}
+					m.payCyclePromptErr = ""
+					return m, m.savePayCycleGoalCmd(account.id, fmt.Sprintf("%.2f", float64(goalCents)/100.0))
+				}
+			}
+			var cmd tea.Cmd
+			m.payCycleInput, cmd = m.payCycleInput.Update(msg)
+			m.payCyclePromptErr = ""
+			if m.payCyclePromptMode == payCyclePromptNextDate {
+				m.payCycleInput.SetValue(limitDigits(digitsOnly(m.payCycleInput.Value()), 8))
+			}
+			if m.payCyclePromptMode == payCyclePromptGoal {
+				m.payCycleInput.SetValue(normalizeGoalInput(m.payCycleInput.Value()))
 			}
 			return m, cmd
 		}
@@ -1147,6 +1426,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsFocus = (m.transactionsFocus + 1) % 4
 				return m, nil
 			}
+			if m.screen == screenPayCycleBurndown &&
+				m.payCyclePromptMode == payCyclePromptNone &&
+				m.payCyclePaneOpen {
+				if m.payCyclePaneFocus == payCyclePaneFocusDetails {
+					m.payCyclePaneFocus = payCyclePaneFocusMain
+				} else {
+					m.payCyclePaneFocus = payCyclePaneFocusDetails
+				}
+				return m, nil
+			}
 			if m.screen == screenTransactions &&
 				m.transactionsViewMode == transactionsViewModeChart &&
 				m.transactionsChartPaneOpen {
@@ -1188,6 +1477,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsChartPaneDetailTxID = ""
 				return m, nil
 			}
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() &&
+				m.payCyclePaneOpen {
+				m.payCyclePaneOpen = false
+				m.payCyclePaneFocus = payCyclePaneFocusMain
+				return m, nil
+			}
 			if m.screen == screenTransactionsFilters && m.transactionsCalendarOpen {
 				m.transactionsCalendarOpen = false
 				return m, nil
@@ -1201,6 +1498,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.accountsPaneFocus = accountsFocusCards
 				return m, nil
 			}
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				m.screen = screenHome
+				m.payCyclePromptMode = payCyclePromptNone
+				m.payCyclePromptErr = ""
+				m.payCycleInput.SetValue("")
+				m.payCycleInput.Blur()
+				m.cmd.Focus()
+				return m, nil
+			}
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
@@ -1211,6 +1519,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenHome
 				m.transactionsSession++
 				m.transactionsSyncing = false
+				m.cmd.Focus()
 				return m, nil
 			}
 			if m.screen == screenAccounts &&
@@ -1218,6 +1527,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				!m.shouldShowCommandSuggestions() {
 				m.screen = screenHome
 				m.accountsSession++
+				m.cmd.Focus()
 				return m, nil
 			}
 			if strings.TrimSpace(m.cmd.Value()) != "" || m.shouldShowCommandSuggestions() {
@@ -1276,6 +1586,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, m.loadTransactionsPreviewCmd()
 				}
+				return m, nil
+			}
+			if m.screen == screenPayCycleBurndown {
+				if m.payCycleCursor > 0 {
+					m.payCycleCursor--
+				}
+				m.refreshPayCyclePrompt()
+				if m.payCyclePromptMode == payCyclePromptNone {
+					cmd := m.loadPayCycleSeriesCmd()
+					if cmd == nil {
+						m.payCycleSeries = nil
+						m.payCycleTransactions = nil
+						m.payCycleTxCursor = 0
+						m.payCycleCurrentBalanceCents = 0
+						m.payCycleGoalCents = 0
+						m.payCycleStartDate = ""
+						m.payCycleEndDate = ""
+						return m, nil
+					}
+					return m, cmd
+				}
+				m.payCycleSeries = nil
+				m.payCycleTransactions = nil
+				m.payCycleTxCursor = 0
+				m.payCycleCurrentBalanceCents = 0
 				return m, nil
 			}
 			if m.screen == screenAccounts {
@@ -1355,6 +1690,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.screen == screenPayCycleBurndown {
+				if m.payCycleCursor < len(m.payCycleAccounts)-1 {
+					m.payCycleCursor++
+				}
+				m.refreshPayCyclePrompt()
+				if m.payCyclePromptMode == payCyclePromptNone {
+					cmd := m.loadPayCycleSeriesCmd()
+					if cmd == nil {
+						m.payCycleSeries = nil
+						m.payCycleTransactions = nil
+						m.payCycleTxCursor = 0
+						m.payCycleCurrentBalanceCents = 0
+						m.payCycleGoalCents = 0
+						m.payCycleStartDate = ""
+						m.payCycleEndDate = ""
+						return m, nil
+					}
+					return m, cmd
+				}
+				m.payCycleSeries = nil
+				m.payCycleTransactions = nil
+				m.payCycleTxCursor = 0
+				m.payCycleCurrentBalanceCents = 0
+				return m, nil
+			}
 			if m.screen == screenAccounts {
 				if m.accountsPaneOpen && m.accountsPaneFocus == accountsFocusPane {
 					if m.accountsAction < len(m.currentAccountActionItems())-1 {
@@ -1393,6 +1753,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() &&
+				m.payCyclePromptMode == payCyclePromptNone {
+				if m.payCycleTxCursor > 0 {
+					m.payCycleTxCursor--
+				}
+				return m, nil
+			}
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() &&
@@ -1422,6 +1791,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.transactionsIncludeInternal = true
 					return m, nil
 				}
+			}
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() &&
+				m.payCyclePromptMode == payCyclePromptNone {
+				if m.payCycleTxCursor < len(m.payCycleTransactions)-1 {
+					m.payCycleTxCursor++
+				}
+				return m, nil
 			}
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
@@ -1563,7 +1941,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transactionsSearchInput.Blur()
 				return m, m.loadTransactionsPreviewCmd()
 			}
+		case "g":
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if m.payCyclePromptMode != payCyclePromptNone {
+					return m, nil
+				}
+				account, ok := m.payCycleSelectedAccount()
+				if !ok {
+					return m, nil
+				}
+				m.payCyclePromptMode = payCyclePromptGoal
+				m.payCyclePromptErr = ""
+				m.payCycleInput.Placeholder = "0.00"
+				m.payCycleInput.SetValue(strings.TrimSpace(account.goalBalance))
+				m.payCycleInput.Focus()
+				return m, nil
+			}
 		case "enter":
+			if m.screen == screenPayCycleBurndown &&
+				strings.TrimSpace(m.cmd.Value()) == "" &&
+				!m.shouldShowCommandSuggestions() {
+				if m.payCyclePromptMode != payCyclePromptNone {
+					return m, nil
+				}
+				if len(m.payCycleTransactions) == 0 {
+					m.payCycleConfigReturn = true
+					m.payCyclePromptGoalAfterConfig = false
+					m.configErr = ""
+					return m.enterConfigView()
+				}
+				m.payCyclePaneOpen = true
+				m.payCyclePaneFocus = payCyclePaneFocusDetails
+				return m, nil
+			}
 			if m.screen == screenTransactions &&
 				strings.TrimSpace(m.cmd.Value()) == "" &&
 				!m.shouldShowCommandSuggestions() {
@@ -1652,6 +2064,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.accountsGoalInput.Focus()
 					return m, nil
 				}
+				if selectedAction == "burndown chart" {
+					return m.enterPayCycleBurndownView()
+				}
 				return m.withCommandFeedback(fmt.Sprintf("%s: coming soon", selectedAction))
 			}
 			if m.screen == screenHome &&
@@ -1664,6 +2079,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m.enterAccountsView()
 				case "transactions":
 					return m.enterTransactionsView()
+				case "pay cycle burndown":
+					return m.enterPayCycleBurndownView()
 				default:
 					return m, nil
 				}
@@ -1687,6 +2104,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.screen == screenTransactionsFilters {
+		return m, nil
+	}
+	if m.screen == screenPayCycleBurndown {
 		return m, nil
 	}
 	m.cmd, cmd = m.cmd.Update(msg)
@@ -1763,6 +2183,22 @@ func (m model) View() string {
 	}
 	if m.screen == screenTransactionsFilters {
 		content := contentStyle.Render(m.renderTransactionsFiltersScreen(layoutWidth))
+		if m.showHelpOverlay {
+			helpOverlay := renderHelpOverlay(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, helpOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		if m.authDialog != authDialogNone {
+			authOverlay := m.renderAuthDialog(layoutWidth)
+			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
+			centered := lipgloss.Place(layoutWidth, layoutHeight, lipgloss.Center, lipgloss.Center, authOverlay)
+			return frame.Render(contentStyle.Render(centered))
+		}
+		return frame.Render(content)
+	}
+	if m.screen == screenPayCycleBurndown {
+		content := contentStyle.Render(m.renderPayCycleBurndownScreen(layoutWidth))
 		if m.showHelpOverlay {
 			helpOverlay := renderHelpOverlay(layoutWidth)
 			layoutHeight := max(1, m.height-frame.GetVerticalFrameSize()-contentStyle.GetVerticalFrameSize())
@@ -1941,6 +2377,8 @@ func (m model) runSlashCommand(input string) (tea.Model, tea.Cmd) {
 		return m.enterAccountsView()
 	case "/transactions":
 		return m.enterTransactionsView()
+	case "/pay-cycle-burndown", "/burndown":
+		return m.enterPayCycleBurndownView()
 	case "/ping":
 		next, cmd := m.withCommandFeedback("checking connection...")
 		return next, tea.Batch(cmd, checkConnectionCmd)
@@ -2737,6 +3175,7 @@ func commandCatalog() []commandSpec {
 		{name: "/config", description: "open app config"},
 		{name: "/accounts", description: "select the accounts view"},
 		{name: "/transactions", description: "select the transactions view"},
+		{name: "/pay-cycle-burndown", description: "open pay cycle burndown view"},
 		{name: "/ping", description: "check Up API connectivity"},
 		{name: "/disconnect", description: "remove saved PAT from keychain"},
 		{name: "/db-wipe", description: "wipe and reinitialize the local database"},
