@@ -264,18 +264,31 @@ func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *
 	}
 
 	parts := splitTransactionsSearchParts(normalized)
+	lastField := ""
 	for _, rawPart := range parts {
 		part := strings.TrimSpace(rawPart)
 		if part == "" {
 			return fmt.Errorf("invalid search syntax")
 		}
+
+		field := ""
+		value := ""
 		colon := strings.Index(part, ":")
-		if colon <= 0 || colon == len(part)-1 {
+		switch {
+		case colon > 0:
+			if colon == len(part)-1 {
+				return fmt.Errorf("invalid search syntax")
+			}
+			field = strings.ToLower(strings.TrimSpace(part[:colon]))
+			value = strings.TrimSpace(part[colon+1:])
+		case colon == -1 && lastField == "exclude-category":
+			// Allow shorthand continuation for exclude-category:
+			//   /exclude-category: uncat + hobb
+			field = lastField
+			value = part
+		default:
 			return fmt.Errorf("invalid search syntax")
 		}
-
-		field := strings.ToLower(strings.TrimSpace(part[:colon]))
-		value := strings.TrimSpace(part[colon+1:])
 		if value == "" {
 			return fmt.Errorf("invalid search syntax")
 		}
@@ -321,6 +334,7 @@ func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *
 		default:
 			return fmt.Errorf("invalid search syntax")
 		}
+		lastField = field
 	}
 
 	return nil
@@ -1063,7 +1077,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("merchant: case-insensitive match on merchant text"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("description: case-insensitive match on description"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("category: case-insensitive match on category id"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("exclude-category: exclude category matches (repeat to exclude many)"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("exclude-category: exclude matches (repeat key or append + term)"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("amount: numeric compare, e.g. >60, <=12.50, =25"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("type: +ve (credits) or -ve (debits)"),
 		}
