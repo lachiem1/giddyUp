@@ -212,6 +212,9 @@ func (m model) saveTransactionsFiltersCmd() tea.Cmd {
 }
 
 func appendTransactionsSearchClauses(searchQuery string, where *[]string, args *[]any) error {
+	if isTransactionsSearchHelpQuery(searchQuery) {
+		return nil
+	}
 	normalized := normalizeTransactionsSearchQuery(searchQuery)
 	if normalized == "" {
 		return nil
@@ -283,6 +286,11 @@ func normalizeTransactionsSearchQuery(searchQuery string) string {
 		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "/"))
 	}
 	return trimmed
+}
+
+func isTransactionsSearchHelpQuery(searchQuery string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(searchQuery))
+	return trimmed == "/help" || trimmed == "help"
 }
 
 func splitTransactionsSearchParts(searchQuery string) []string {
@@ -662,7 +670,7 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 		Foreground(lipgloss.Color("#9CA3AF")).
 		Width(tableOuterWidth).
 		Align(lipgloss.Center).
-		Render("sort: " + sortLabel)
+		Render("sort: " + sortLabel + "  |  dates: " + rangeLabel)
 
 	start := 0
 	end := 0
@@ -674,15 +682,31 @@ func (m model) renderTransactionsScreen(layoutWidth int) string {
 	if m.transactionsPageSize > 0 && m.transactionsTotal > 0 {
 		totalPages = (m.transactionsTotal-1)/m.transactionsPageSize + 1
 	}
-	footer := []string{
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
-			Width(tableOuterWidth).
-			Align(lipgloss.Center).
-			Render(fmt.Sprintf("showing %d-%d/%d  |  page %d/%d  |  dates: %s", start, end, m.transactionsTotal, m.transactionsPage+1, max(1, totalPages), rangeLabel)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
-			Width(tableOuterWidth).
-			Align(lipgloss.Center).
-			Render("/ focus search  |  enter apply  |  f filters  s sort"),
+	showSearchHelp := isTransactionsSearchHelpQuery(m.transactionsSearchApplied)
+	footer := []string{}
+	if showSearchHelp {
+		footer = []string{
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("Search format: field: value + field: value"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("Example 1: merchant: WOOL + amount: >60"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("Example 2: category: groceries + type: -ve"),
+			"",
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("merchant: case-insensitive match on merchant text"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("description: case-insensitive match on description"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("category: case-insensitive match on category id"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("amount: numeric compare, e.g. >60, <=12.50, =25"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Width(tableOuterWidth).Render("type: +ve (credits) or -ve (debits)"),
+		}
+	} else {
+		footer = []string{
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
+				Width(tableOuterWidth).
+				Align(lipgloss.Center).
+				Render(fmt.Sprintf("showing %d-%d/%d  |  page %d/%d", start, end, m.transactionsTotal, m.transactionsPage+1, max(1, totalPages))),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).
+				Width(tableOuterWidth).
+				Align(lipgloss.Center).
+				Render("/ focus search  |  enter apply  |  f filters  s sort"),
+		}
 	}
 
 	statusLines := []string{}
