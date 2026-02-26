@@ -597,6 +597,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.clampAccountsAction()
 		m.ensureAccountsScrollWindow()
+		if m.screen == screenPayCycleBurndown {
+			return m, m.loadPayCycleStateCmd()
+		}
 		return m, nil
 
 	case moveAccountMsg:
@@ -868,22 +871,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.transactionsSyncing = false
 		now := time.Now().UTC()
 		m.transactionsLastSync = &now
+		if m.screen == screenPayCycleBurndown {
+			return m, tea.Batch(
+				m.loadTransactionsPreviewCmd(),
+				m.loadPayCycleStateCmd(),
+				m.syncAndReloadAccountsPreviewCmd(false),
+			)
+		}
 		return m, m.loadTransactionsPreviewCmd()
 
 	case transactionsReloadTickMsg:
-		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) || !m.transactionsSyncing {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters && m.screen != screenPayCycleBurndown) || !m.transactionsSyncing {
 			return m, nil
+		}
+		if m.screen == screenPayCycleBurndown {
+			return m, tea.Batch(m.loadPayCycleStateCmd(), m.transactionsReloadTickCmd())
 		}
 		return m, tea.Batch(m.loadTransactionsPreviewCmd(), m.transactionsReloadTickCmd())
 
 	case transactionsClockTickMsg:
-		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters && m.screen != screenPayCycleBurndown) {
 			return m, nil
 		}
 		return m, m.transactionsClockTickCmd()
 
 	case transactionsAutoRefreshTickMsg:
-		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters) {
+		if msg.sessionID != m.transactionsSession || (m.screen != screenTransactions && m.screen != screenTransactionsFilters && m.screen != screenPayCycleBurndown) {
 			return m, nil
 		}
 		next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
