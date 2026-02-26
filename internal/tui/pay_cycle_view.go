@@ -82,7 +82,24 @@ func (m model) enterPayCycleBurndownView() (tea.Model, tea.Cmd) {
 	m.payCycleConfigReturn = false
 	m.payCyclePromptGoalAfterConfig = false
 	m.cmd.Blur()
-	return m, m.loadPayCycleStateCmd()
+	next, syncCmd := m.maybeStartTransactionsSyncCmd(false)
+	accountsSyncCmd := next.syncAndReloadAccountsPreviewCmd(false)
+	if syncCmd != nil {
+		return next, tea.Batch(
+			next.loadPayCycleStateCmd(),
+			accountsSyncCmd,
+			syncCmd,
+			next.transactionsReloadTickCmd(),
+			next.transactionsClockTickCmd(),
+			next.transactionsAutoRefreshTickCmd(),
+		)
+	}
+	return next, tea.Batch(
+		next.loadPayCycleStateCmd(),
+		accountsSyncCmd,
+		next.transactionsClockTickCmd(),
+		next.transactionsAutoRefreshTickCmd(),
+	)
 }
 
 func (m model) loadPayCycleStateCmd() tea.Cmd {
@@ -628,8 +645,19 @@ func renderPayCycleBurndownLines(
 		x := pointX[i] + 1
 		pointY[i] = y
 		if prevX >= 0 {
-			skipFutureTail := todayCol > 0 && prevX <= todayCol && x > todayCol
-			drawPayCycleSegment(grid, codes, prevX, prevY, x, y, '.', payCycleCellActual, xAxisRow, todayCol, skipFutureTail)
+			// Render burndown as a step graph:
+			// hold previous balance horizontally until the transaction time, then jump vertically.
+			if x != prevX {
+				skipFutureTail := todayCol > 0 && prevX <= todayCol && x > todayCol
+				drawPayCycleSegment(grid, codes, prevX, prevY, x, prevY, '.', payCycleCellActual, xAxisRow, todayCol, skipFutureTail)
+			}
+			if y != prevY {
+				skipFutureTail := false
+				if todayCol > 0 && x > todayCol {
+					skipFutureTail = true
+				}
+				drawPayCycleSegment(grid, codes, x, prevY, x, y, '.', payCycleCellActual, xAxisRow, todayCol, skipFutureTail)
+			}
 		}
 		prevX, prevY = x, y
 	}
@@ -1109,6 +1137,18 @@ func (m model) renderPayCycleBurndownScreen(layoutWidth int) string {
 		Align(lipgloss.Center).
 		Render(hint)
 	footer = lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, footer)
+	statusLines := []string{}
+	if m.transactionsFetched != nil {
+		age := time.Since(m.transactionsFetched.UTC()).Round(time.Second)
+		if age < 0 {
+			age = 0
+		}
+		statusLines = append(statusLines, lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")).
+			Width(lipgloss.Width(mainBlock)).
+			Align(lipgloss.Center).
+			Render(fmt.Sprintf("last updated %s ago", age.String())))
+	}
 
 	parts := []string{title}
 	parts = append(parts, "", mainBlock)
@@ -1139,5 +1179,8 @@ func (m model) renderPayCycleBurndownScreen(layoutWidth int) string {
 		parts = append(parts, "", metaBlock)
 	}
 	parts = append(parts, "", footer)
+	if len(statusLines) > 0 {
+		parts = append(parts, "", lipgloss.PlaceHorizontal(layoutWidth, lipgloss.Center, strings.Join(statusLines, "\n")))
+	}
 	return strings.Join(parts, "\n")
 }
